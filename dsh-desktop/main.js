@@ -2033,14 +2033,20 @@ function fatal(title, err) {
 // ---------------------------------------------------------------------------
 
 function showUpdateWindow(version, kind = 'agent') {
+  // 更新进度窗必须保持主窗口可用：不设 parent/modal，并允许最小化与关闭。
+  // 旧实现 modal:true + minimizable:false 会在整个下载期间禁用主窗口（下载
+  // 安装包可长达数分钟），用户既不能继续使用应用，也无法把进度窗最小化；
+  // 且模态进度窗未关闭时主窗处于禁用态，随后的「下载完成/更新完成」对话框
+  // 可能无法正常弹出，表现为「下载成功但无法更新」。关闭本窗口不会取消
+  // 后台更新/下载，完成对话框仍会照常弹出。
   const win = new BrowserWindow({
     width: 460,
     height: 300,
     resizable: false,
-    minimizable: false,
+    minimizable: true,
     maximizable: false,
-    parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
-    modal: true,
+    closable: true,
+    autoHideMenuBar: true,
     title: '正在更新',
     icon: path.join(__dirname, 'assets', 'icon.png'),
     webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false },
@@ -2052,6 +2058,10 @@ function showUpdateWindow(version, kind = 'agent') {
   });
   win.once('ready-to-show', () => win.show());
   return win;
+}
+
+function closeUpdateWindow(win) {
+  if (win && !win.isDestroyed()) win.destroy();
 }
 
 async function runUpdateFlow(manual) {
@@ -2146,6 +2156,8 @@ async function runUpdateFlow(manual) {
       applyMenuViewportFix();
       applySessionManageFix();
     }
+    // 进度窗已非模态，但完成对话框弹出前仍先关闭它，避免叠窗/对话框被遮挡。
+    closeUpdateWindow(progressWin);
     const { response: r2 } = await showBox({
       type: 'info',
       title: '更新完成',
@@ -2170,6 +2182,7 @@ async function runUpdateFlow(manual) {
       app.exit(0);
     }
   } catch (err) {
+    closeUpdateWindow(progressWin);
     log('update', '更新失败: ' + err.message);
     await showBox({
       type: 'error',
@@ -3984,31 +3997,33 @@ function quitForClientUpdate(ctx, pending) {
   quitting = true;
   forceQuit = true;
   markCleanExit();
-  // 无条件清除待安装标记并记录一次安装尝试：更新脚本一旦启动就由它负责完成。
-  // 若脚本失败 / 被安全软件拦截，下次启动会依据 clientUpdateAttempt 识别为
-  // 「更新未完成」，而不是再次弹出同一个「有待安装的客户端更新」。
+  // 保留 pendingClientUpdate / pendingClientVersion，只记录一次安装尝试。
+  // 本次尝试可能失败（安装器被取消/拦截、文件被占用、目录只读），下次启动时
+  // offerPendingClientUpdate 会依据「版本仍未升级 + clientUpdateAttempt」进入
+  // 「客户端更新未完成」重试流程；更新成功后新版本启动时会因
+  // pending.version <= APP_VERSION 自动清掉标记。
   try {
     const s = updater.loadSettings(ctx);
-    s.pendingClientUpdate = null;
-    s.pendingClientVersion = null;
     s.clientUpdateSnoozeUntil = null;
     s.clientUpdateAttempt = {
       version: pending && pending.version ? pending.version : null,
       at: Date.now(),
       appVersion: APP_VERSION,
+      path: pending && pending.path ? pending.path : null,
+      source: pending && pending.source ? pending.source : null,
     };
     updater.saveSettings(ctx, s);
-    // 回读校验：清理必须真正落盘，否则重启后旧标记会再次触发待安装弹窗。
+    // 回读校验：安装尝试必须真正落盘，否则更新失败后无法识别为「未完成」。
     const verify = updater.loadSettings(ctx);
-    if (verify.pendingClientUpdate) {
-      verify.pendingClientUpdate = null;
+    if (!verify.clientUpdateAttempt || verify.clientUpdateAttempt.at !== s.clientUpdateAttempt.at) {
       verify.clientUpdateAttempt = s.clientUpdateAttempt;
+      verify.clientUpdateSnoozeUntil = null;
       updater.saveSettings(ctx, verify);
-      log('client-update', '待安装标记清理第一次未生效，已重试并回读确认');
+      log('client-update', '安装尝试记录第一次未落盘，已重试并回读确认');
     }
-    log('client-update', '待安装标记已清理' + (updater.loadSettings(ctx).pendingClientUpdate ? '（仍存在，需人工检查 settings.json）' : ''));
+    log('client-update', '已记录安装尝试并保留待安装标记（更新失败后可在下次启动重试）');
   } catch (err) {
-    log('client-update', '清理待安装标记失败: ' + err.message);
+    log('client-update', '记录安装尝试失败: ' + err.message);
   }
   try {
     killTreeSync(serverProc);
@@ -4110,6 +4125,8 @@ async function runClientUpdateFlow(manual) {
     settings.skipClientVersion = null;
     settings.pendingClientVersion = null;
     updater.saveSettings(ctx, settings);
+    // 先关进度窗再弹「下载完成」：避免窗口叠层，也保证对话框不被遮挡。
+    closeUpdateWindow(progressWin);
     const { response: r2 } = await showBox({
       type: 'info',
       title: '下载完成',
@@ -4123,6 +4140,7 @@ async function runClientUpdateFlow(manual) {
       quitForClientUpdate(ctx, settings.pendingClientUpdate);
     }
   } catch (err) {
+    closeUpdateWindow(progressWin);
     log('client-update', '更新失败: ' + err.message);
     await showBox({
       type: 'error',
@@ -4144,12 +4162,14 @@ function offerPendingClientUpdate() {
   if (!pending || !pending.path) return;
   if (!fs.existsSync(pending.path)) {
     settings.pendingClientUpdate = null;
+    settings.pendingClientVersion = null;
     settings.clientUpdateAttempt = null;
     updater.saveSettings(ctx, settings);
     return;
   }
   if (updater.compareVersions(pending.version, APP_VERSION) <= 0) {
     settings.pendingClientUpdate = null;
+    settings.pendingClientVersion = null;
     settings.clientUpdateAttempt = null;
     settings.clientUpdateSnoozeUntil = null;
     updater.saveSettings(ctx, settings);

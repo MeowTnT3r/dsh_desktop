@@ -188,6 +188,10 @@ function downloadFile(url, dest, { onProgress } = {}) {
           res.resume();
           return fail(new Error('下载失败 HTTP ' + res.statusCode));
         }
+        // 服务器在传输中途异常断开时，不要留下一个永远不结束的 Promise
+        // （下载窗口会一直转圈且没有任何报错）。
+        res.on('aborted', () => fail(new Error('下载连接被中断（服务器提前断开）')));
+        res.on('error', fail);
         const total = Number(res.headers['content-length'] || 0);
         res.on('data', (c) => {
           received += c.length;
@@ -274,6 +278,15 @@ const SYS = [
 
 // 便携版更新脚本（cmd）：仅依赖文件操作与 ping，在 detached 无控制台进程下
 // 工作正常（不依赖 tasklist/find 这类控制台程序输出）。
+//
+// 更新失败自愈（「下载成功但重启后仍是旧版」的根因修复）：
+//   · 替换 NEW->OLD 失败时重试 12 次（每次约 2s），吸收杀软对刚下载完的
+//     安装包扫描锁定等瞬时占用；
+//   · 等待旧 exe 解锁超过约 20s 仍失败时，用 `copy /y NUL` 写入探针区分
+//     「目录只读」与「文件仍被占用」（copy 的 errorlevel 可靠，且对已存在
+//     的只读/目录型探针路径同样有效）：只读目录不再空等 10 分钟，直接降级
+//     为启动新 exe（与 README 承诺一致），并保留下载文件；
+//   · 替换失败且目录可写时，尽力用 .bak 还原当前版本并启动，绝不留坏 exe。
 function buildPortableCmd(logFile) {
   return [
     '@echo off',
@@ -287,31 +300,60 @@ function buildPortableCmd(logFile) {
     'set /a tries=0',
     ':wait',
     'set /a tries+=1',
-    'if %tries% gtr 300 goto failed',
+    'if %tries% gtr 300 goto replace_failed',
     '%PG% -n 2 127.0.0.1 >nul',
     'if not exist "%OLD%" goto replace',
     'copy /y "%OLD%" "%OLD%.bak" >nul 2>&1',
-    'if errorlevel 1 goto wait',
+    'if errorlevel 1 goto wait_probe',
     'del /f /q "%OLD%" >nul 2>&1',
-    'if exist "%OLD%" goto wait',
+    'if exist "%OLD%" goto wait_probe',
+    'goto replace',
+    ':wait_probe',
+    'if %tries% geq 10 (',
+    '  copy /y NUL "%OLD%.dsh-write-test" >nul 2>&1',
+    '  if errorlevel 1 goto replace_failed',
+    '  del "%OLD%.dsh-write-test" >nul 2>&1',
+    ')',
+    'goto wait',
     ':replace',
+    'echo [%date% %time%] replacing current build >> "%LOG%"',
+    'set /a rtry=0',
+    ':retry_replace',
     'copy /y "%NEW%" "%OLD%" >nul 2>&1',
-    'if errorlevel 1 goto failed',
-    'del "%NEW%" >nul 2>&1',
+    'if not errorlevel 1 goto replaced',
+    'set /a rtry+=1',
+    'if %rtry% lss 12 (',
+    '  %PG% -n 2 127.0.0.1 >nul',
+    '  goto retry_replace',
+    ')',
+    'goto replace_failed',
+    ':replaced',
     'echo [%date% %time%] replaced, relaunching >> "%LOG%"',
     'start "" "%OLD%"',
     'if exist "%OLD%.bak" del "%OLD%.bak" >nul 2>&1',
-    'del "%~f0" >nul 2>&1',
+    'del "%NEW%" >nul 2>&1',
+    '(goto) 2>nul & del "%~f0"',
     'exit /b 0',
-    ':failed',
-    // M3 修复：超时后先尽力复制回原位再启动，避免便携版从 updates 目录
-    // 直接启动导致新建 data 目录、丢失设置。
-    'echo [%date% %time%] timed out, restoring >> "%LOG%"',
+    ':replace_failed',
+    'echo [%date% %time%] replace failed; probing target dir >> "%LOG%"',
+    'copy /y NUL "%OLD%.dsh-write-test" >nul 2>&1',
+    'if not errorlevel 1 (',
+    '  del "%OLD%.dsh-write-test" >nul 2>&1',
+    '  echo [%date% %time%] target dir writable; restoring current build >> "%LOG%"',
+    '  goto restore_old',
+    ')',
+    'echo [%date% %time%] target dir read-only; launching new build directly >> "%LOG%"',
+    'if not exist "%NEW%" goto restore_old',
+    'start "" "%NEW%"',
+    '(goto) 2>nul & del "%~f0"',
+    'exit /b 0',
+    ':restore_old',
+    'echo [%date% %time%] restoring current build >> "%LOG%"',
     'if exist "%OLD%.bak" copy /y "%OLD%.bak" "%OLD%" >nul 2>&1',
     'if not exist "%OLD%" copy /y "%NEW%" "%OLD%" >nul 2>&1',
     'if exist "%OLD%" (start "" "%OLD%") else (start "" "%NEW%")',
     'if exist "%OLD%.bak" del "%OLD%.bak" >nul 2>&1',
-    'del "%~f0" >nul 2>&1',
+    '(goto) 2>nul & del "%~f0"',
     'exit /b 0',
   ].join('\r\n');
 }
@@ -353,7 +395,11 @@ $setupSucceeded = $false
 try {
   $sp = Start-Process -FilePath $Setup -Wait -PassThru -ErrorAction Stop
   Log ("setup finished (err=" + $sp.ExitCode + ")")
-  $setupSucceeded = $true
+  # Only exit code 0 means "installed": NSIS returns non-zero when the user
+  # cancels or the wizard fails. Treating every completed process as success
+  # made the cancelled-update path delete the retained installer package and
+  # break the retry loop.
+  $setupSucceeded = ($sp.ExitCode -eq 0)
 } catch {
   Log ("setup launch failed: " + $_.Exception.Message)
 }
@@ -424,7 +470,16 @@ if (-not $launched) {
     Log "previous build not found; user will need to start the app manually"
   }
 }
-Remove-Item -LiteralPath $Setup -Force -ErrorAction SilentlyContinue
+# Keep the installer package when the update did not actually take effect
+# (setup failed/cancelled or the new build never started), so the next boot
+# can offer "retry install" with the already-downloaded file instead of
+# forcing a full re-download.
+if ($setupSucceeded -and $launched) {
+  Remove-Item -LiteralPath $Setup -Force -ErrorAction SilentlyContinue
+  Log "apply-update succeeded; installer package removed"
+} else {
+  Log "apply-update did not take effect; installer package kept for retry: $Setup"
+}
 Log "apply-update done"
 `;
 }
@@ -496,4 +551,15 @@ function applyUpdate(ctx, pending) {
   return { script, logFile };
 }
 
-module.exports = { checkLatest, selectAsset, downloadRelease, applyUpdate, isPortable, resolveRepos, DEFAULT_REPOS };
+module.exports = {
+  checkLatest,
+  selectAsset,
+  downloadRelease,
+  applyUpdate,
+  buildPortableCmd,
+  buildNsisPs1,
+  buildNsisCmd,
+  isPortable,
+  resolveRepos,
+  DEFAULT_REPOS,
+};

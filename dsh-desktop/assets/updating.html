@@ -49,8 +49,8 @@
       ? '正在下载 DSH Desktop v' + version + ' …'
       : '正在更新 @deepseek-ai/dsh → ' + version;
     document.getElementById('note').textContent = kind === 'client'
-      ? '从上游仓库下载新版本客户端，完成后自动替换并重启应用。'
-      : '正在从 npm 官方源下载新版本及其依赖。首次更新约需下载 250MB，请耐心等待；详细进度见日志目录中的 update.log。';
+      ? '从上游仓库下载新版本客户端，完成后自动替换并重启应用。本窗口可最小化或关闭，下载会在后台继续，完成后会再次提示。'
+      : '正在从 npm 官方源下载新版本及其依赖。首次更新约需下载 250MB，请耐心等待；详细进度见日志目录中的 update.log。本窗口可最小化或关闭，更新会在后台继续，完成后会再次提示。';
   };
   window.__setProgress = function (pct, receivedMB, totalMB) {
     document.getElementById('spinner').style.display = 'none';
