@@ -531,6 +531,35 @@ test('纯逻辑：materializePending 小内容 / 大路径（发送时物化）'
   assert.match(out, /完整路径：C:\\b\.zip/);
 });
 
+test('e2e: 发送物化（点击路径）—— 包装 submit 把 chip 内容写进草稿并清空', async () => {
+  const e = await setupApplied();
+  let submitted = null;
+  e.inputActions.submit = function () { submitted = e.textarea.value; };
+  // 渲染 AttachButton（React stub 同步跑 effect → 安装 submit 包装 + keydown 监听）
+  const entry = e.slotRegistrations[0].register();
+  entry.component({ inputActions: e.inputActions, input: e.input });
+  e.store.addPending(e.inputActions, e.mod.core.makePendingTextEntry('a.md', 5, '', 'hello-file'));
+  assert.equal(e.store.snapshotPending(e.inputActions).length, 1, 'chip 已入列');
+  // 点击发送按钮 → 走包装后的 submit
+  e.inputActions.submit();
+  assert.match(submitted, /<!-- 附件：a\.md -->\nhello-file/, '草稿应包含文件内容');
+  assert.equal(e.store.snapshotPending(e.inputActions).length, 0, 'chip 应被清空');
+});
+
+test('e2e: 发送物化（回车路径）—— 捕获阶段 keydown 把 chip 内容写进草稿并清空', async () => {
+  const e = await setupApplied();
+  e.inputActions.submit = function () {}; // 使守卫通过（setupApplied 的 mock 无 submit）
+  const entry = e.slotRegistrations[0].register();
+  entry.component({ inputActions: e.inputActions, input: e.input });
+  e.store.addPending(e.inputActions, e.mod.core.makePendingTextEntry('b.md', 5, '', 'world-file'));
+  const h = e.listeners.document.keydown;
+  assert.ok(Array.isArray(h) && h.length >= 1, '应注册 keydown 捕获监听');
+  // 回车发送：捕获阶段先物化，React 回车处理器随后 submit 才读得到草稿。
+  h[0]({ key: 'Enter' });
+  assert.match(e.textarea.value, /<!-- 附件：b\.md -->\nworld-file/, '草稿应包含文件内容');
+  assert.equal(e.store.snapshotPending(e.inputActions).length, 0, 'chip 应被清空');
+});
+
 // ---------------------------------------------------------------------------
 // 3) dsh-image-paste 让位回归（defaultPrevented 不再走桥存盘）
 // ---------------------------------------------------------------------------

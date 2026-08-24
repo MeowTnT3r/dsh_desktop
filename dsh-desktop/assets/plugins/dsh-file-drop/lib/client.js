@@ -803,27 +803,39 @@
       });
 
       // 发送钩子：非图片文件以附件 chip 暂存，发送时物化进草稿（小内容/大路径）。
-      // 包装 inputActions.submit（会话级稳定 identity，发送按钮点击时才读
-      // inputActions.submit，故包装生效）；键盘 Enter 也走同一 submit。
+      // 两条发送路径都要物化：
+      //   · 点击发送按钮 → inputActions.submit()（包装它）；
+      //   · 回车发送 → keyboard.submit(mode) 直接调 SessionInputShell.submit，
+      //     绕过 actions.submit —— 用捕获阶段 keydown 在 React 回车处理器前物化。
       var inputRef = useRef(input);
       useEffect(function () { inputRef.current = input; });
       useEffect(function () {
         if (!inputActions || typeof inputActions.submit !== 'function' || typeof inputActions.setDraft !== 'function') return;
         var orig = inputActions.submit;
-        inputActions.submit = function () {
+        function materialize() {
           var pending = snapshotPending(inputActions);
-          if (pending.length > 0) {
-            var cur = '';
-            var c = findComposer();
-            if (c && typeof c.value === 'string') cur = c.value;
-            else if (inputRef.current && typeof inputRef.current.draft === 'string') cur = inputRef.current.draft;
-            var text = materializePending(pending);
-            clearPending(inputActions);
-            if (text) inputActions.setDraft(cur + (cur ? '\n' : '') + text + '\n');
-          }
-          return orig();
+          if (pending.length === 0) return;
+          var cur = '';
+          var c = findComposer();
+          if (c && typeof c.value === 'string') cur = c.value;
+          else if (inputRef.current && typeof inputRef.current.draft === 'string') cur = inputRef.current.draft;
+          var text = materializePending(pending);
+          clearPending(inputActions);
+          if (text) inputActions.setDraft(cur + (cur ? '\n' : '') + text + '\n');
+        }
+        inputActions.submit = function () { materialize(); return orig(); };
+        var onKeydown = function (e) {
+          if (e && (e.key === 'Enter' || e.keyCode === 13)) materialize();
         };
-        return function () { inputActions.submit = orig; };
+        if (typeof document !== 'undefined' && document.addEventListener) {
+          document.addEventListener('keydown', onKeydown, true);
+        }
+        return function () {
+          inputActions.submit = orig;
+          if (typeof document !== 'undefined' && document.removeEventListener) {
+            document.removeEventListener('keydown', onKeydown, true);
+          }
+        };
       }, [inputActions]);
 
       var canAttach = !!(conversationOk(ctx) && typeof inputActions.addImages === 'function');
