@@ -1490,14 +1490,12 @@ jobs:
           for f in gh-assets/*; do
             name=$(basename "$f")
             size=$(stat -c%s "$f")
-            remote=$(jq -r --arg n "$name" '.assets[]? | select(.name==$n) | .size' gitee-now.json | head -1)
+            # Gitee v5 资产对象无 size 字段（只有 name + browser_download_url），
+            # 存在性按 name 判定；大小由 sha256 边车兜底。
+            remote=$(jq -r --arg n "$name" '.assets[]? | select(.name==$n) | .name' gitee-now.json | head -1)
             if [ -n "$remote" ] && [ "$remote" != "null" ]; then
-              if [ "$remote" = "$size" ]; then
-                echo "跳过（已镜像且大小一致）: $name"
-                continue
-              fi
-              echo "::error::$name 已存在但大小不一致（远端=$remote 本地=$size）——上一步入不了这里，请检查 get-or-rebuild 逻辑"
-              exit 1
+              echo "跳过（已镜像）: $name"
+              continue
             fi
             if [ "$size" -gt "$LIMIT" ]; then
               echo "::warning::跳过超 Gitee 100MB 限制的资产: $name（${size} 字节；壳侧自动回落 GitHub 源下载）"
@@ -1528,14 +1526,9 @@ jobs:
               printf '%-52s %12d bytes  [超限跳过，预期缺失]\n' "$name" "$size"
               continue
             fi
-            remote=$(jq -r --arg n "$name" '.assets[]? | select(.name==$n) | .size' gitee-final.json | head -1)
+            remote=$(jq -r --arg n "$name" '.assets[]? | select(.name==$n) | .name' gitee-final.json | head -1)
             if [ -z "$remote" ] || [ "$remote" = "null" ]; then
               echo "::error::Gitee 缺失资产: $name（${size} 字节，未超限不应缺失）"
-              fail=1
-              continue
-            fi
-            if [ "$remote" != "$size" ]; then
-              echo "::error::Gitee 资产大小不一致: $name github=${size} gitee=${remote}"
               fail=1
               continue
             fi
