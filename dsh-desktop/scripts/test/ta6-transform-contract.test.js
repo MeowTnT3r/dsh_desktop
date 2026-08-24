@@ -173,6 +173,6 @@ test('vision 系依赖序：未应用 image-send 时 toggle/key 必须 anchor-mi
   }
 });
 
-test('契约面完整性：35 个 file transform 全部被本文件覆盖', () => {
-  assert.equal(fileSpecs.length, 35);
+test('契约面完整性：39 个 file transform 全部被本文件覆盖', () => {
+  assert.equal(fileSpecs.length, 39);
 });

@@ -17,8 +17,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ComponentType } from 'react'
 import { createPortal } from 'react-dom'
 import clsx from 'clsx'
-import { EditorState } from '@codemirror/state'
-import { EditorView as CodeMirrorView, keymap, lineNumbers } from '@codemirror/view'
+import { EditorState, RangeSet, StateEffect, StateField, type Text } from '@codemirror/state'
+import { Decoration, EditorView as CodeMirrorView, keymap, lineNumbers } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { IconCheckOutline16, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import { api, htmlUrl } from './api.ts'
@@ -31,6 +31,7 @@ import { buildSelectionInsert, linesOfSelection } from './selection-payload.ts'
 import { lazyChunkComponent } from './lazy-chunk.tsx'
 import { splitMermaidBlocks, type MermaidMarkdownProps } from './mermaid-blocks.ts'
 import { t } from './locales.ts'
+import { ensureDiffHighlightCss, highlightKindClass, readFileChangesStore, readFileHighlight } from './file-changes-highlight.ts'
 import type { EditorToolbarState, FileViewerProps } from './service.ts'
 import css from './sidebar.module.css'
 
@@ -63,6 +64,40 @@ const LazyMermaidMarkdown = lazyChunkComponent<MermaidMarkdownProps>(
  */
 export const HTML_IFRAME_SANDBOX = 'allow-scripts allow-popups allow-downloads allow-modals'
 
+/**
+ * Inline agent-diff decorations (K28): a per-editor StateField holding the
+ * line decorations for the current file's agent-changed lines. The field is
+ * defined once and shared across editor instances; each instance pushes a
+ * fresh RangeSet via DiffHighlightEffect when its file's highlight changes.
+ */
+const DiffHighlightEffect = StateEffect.define<RangeSet<Decoration>>()
+const diffHighlightField = StateField.define<RangeSet<Decoration>>({
+  create: () => Decoration.none,
+  update: (value, tr) => {
+    let next = value
+    for (const effect of tr.effects) {
+      if (effect.is(DiffHighlightEffect)) next = effect.value
+    }
+    return next
+  },
+  provide: (field) => CodeMirrorView.decorations.from(field),
+})
+
+/** Build line decorations from per-line kinds (aligned one-to-one with doc lines). */
+function buildDiffDecorations(doc: Text, kinds: ReadonlyArray<'ctx' | 'add' | 'mod'>): RangeSet<Decoration> {
+  const ranges: Array<{ from: number; to: number; value: Decoration }> = []
+  // Clamp to the doc's actual line count: if the file changed after the agent's
+  // last write, kinds may be longer/shorter than the live doc — never throw.
+  const limit = Math.min(kinds.length, doc.lines)
+  for (let i = 0; i < limit; i++) {
+    const kind = kinds[i]
+    if (kind !== 'add' && kind !== 'mod') continue
+    const line = doc.line(i + 1)
+    ranges.push(Decoration.line({ class: highlightKindClass(kind) }).range(line.from))
+  }
+  return RangeSet.of(ranges, true)
+}
+
 export function TextEditor(props: FileViewerProps) {
   const { ctx, scope, path, viewerId, content, truncated } = props
   const [mode, setMode] = useState<ViewMode>('preview')
@@ -83,6 +118,9 @@ export function TextEditor(props: FileViewerProps) {
   const popupRef = useRef<SelectionPopup | null>(null)
   /** The markdown preview container (selection-containment + line lookup). */
   const mdRef = useRef<HTMLDivElement>(null)
+  /** Inline agent-diff highlight: enabled flag + whether this file has changes. */
+  const [diffHighlight, setDiffHighlight] = useState(true)
+  const [hasDiff, setHasDiff] = useState(false)
 
   const hidePopup = (): void => {
     popupRef.current = null
@@ -141,6 +179,7 @@ export function TextEditor(props: FileViewerProps) {
         EditorState.tabSize.of(2),
         CodeMirrorView.contentAttributes.of({ spellcheck: 'false' }),
         cmSurfaceTheme,
+        diffHighlightField,
         themeComp.of(dark),
         ...(language !== null ? [language] : []),
         CodeMirrorView.updateListener.of((update) => {
@@ -214,6 +253,25 @@ export function TextEditor(props: FileViewerProps) {
     // tab's lifetime, and the dark flip is handled by the reconfigure
     // effect below (recreating the view here would drop the draft).
   }, [content, path])
+
+  // Inline agent-diff highlight (K28): read the shared window store published
+  // by dsh-client-file-changes and tint the add/mod lines of the current file.
+  // Without that plugin this is a no-op — the editor renders exactly as before.
+  useEffect(() => {
+    ensureDiffHighlightCss()
+    const store = readFileChangesStore()
+    const applyHighlight = (): void => {
+      const view = viewRef.current
+      const hl = diffHighlight ? readFileHighlight(scope.sessionId, path) : null
+      const kinds = hl !== null && hl.kinds !== undefined && hl.kinds.length > 0 ? hl.kinds : []
+      setHasDiff(hl !== null)
+      if (view === null) return
+      const deco = kinds.length > 0 ? buildDiffDecorations(view.state.doc, kinds) : Decoration.none
+      view.dispatch({ effects: DiffHighlightEffect.of(deco) })
+    }
+    applyHighlight()
+    return store === null ? undefined : store.subscribe(applyHighlight)
+  }, [content, path, scope.sessionId, diffHighlight])
 
   // Scheme flip: re-theme in place (the compartment holds only the
   // scheme-dependent extensions; everything else is untouched).
@@ -362,6 +420,18 @@ export function TextEditor(props: FileViewerProps) {
             onClick={save}
           >
             <IconCheckOutline16 />
+          </button>
+        )}
+        {hasDiff && (
+          <button
+            type="button"
+            className={css.iconButton}
+            aria-label="diff highlight"
+            title={diffHighlight ? '关闭 diff 高亮' : '开启 diff 高亮'}
+            aria-pressed={diffHighlight}
+            onClick={() => { setDiffHighlight(value => !value) }}
+          >
+            <span style={{ opacity: diffHighlight ? 1 : 0.4 }}>±</span>
           </button>
         )}
         {saveLabel !== '' && <span className={clsx(css.editorStatus, saveState === 'failed' && css.editorStatusError)}>{saveLabel}</span>}

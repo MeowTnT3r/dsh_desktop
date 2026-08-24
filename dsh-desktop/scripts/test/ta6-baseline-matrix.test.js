@@ -108,6 +108,8 @@ const BASELINE = {
     'slot-error-isolation': 'anchor-missing',
     'runtime-flash-fix': 'changed',
     'session-event-bound': 'changed',
+    'load-all-history': 'changed',
+    'load-all-history-ui': 'changed',
     'prompt-expose-fix': 'already',
     'shell-description-compat': 'changed',
     'code-mode-compat': 'changed',
@@ -148,6 +150,8 @@ const BASELINE = {
     'adapter-prepare-call-guard': 'changed',
     'session-header-scan-guard': 'changed',
     'session-load-graceful': 'changed',
+    'skill-ui-zh': 'changed',
+    'manual-sort-drag-fix': 'changed',
     'pi-ai-credits': 'root',
     'pi-ai-reasoning-defaults': 'root',
     'bundle-arrival-retry': 'root',
@@ -160,6 +164,8 @@ const BASELINE = {
     'slot-error-isolation': 'target-absent',
     'runtime-flash-fix': 'target-absent',
     'session-event-bound': 'target-absent',
+    'load-all-history': 'target-absent',
+    'load-all-history-ui': 'target-absent',
     'prompt-expose-fix': 'target-absent',
     'shell-description-compat': 'target-absent',
     'code-mode-compat': 'changed',
@@ -200,6 +206,8 @@ const BASELINE = {
     'adapter-prepare-call-guard': 'target-absent',
     'session-header-scan-guard': 'target-absent',
     'session-load-graceful': 'target-absent',
+    'skill-ui-zh': 'target-absent',
+    'manual-sort-drag-fix': 'target-absent',
     'pi-ai-credits': 'root',
     'pi-ai-reasoning-defaults': 'root',
     'bundle-arrival-retry': 'root',
@@ -231,11 +239,11 @@ test('48 补丁 × rc.2 / rc.1 双形态判定矩阵与基线快照一致（锚�
     `判定矩阵漂移（内核形态变化或锚点漂移；确认后更新 BASELINE 快照以显式接受新基线）：\n  ${drift.join('\n  ')}`);
 });
 
-test('基线快照自身完整性：两形态 × 50 id 全覆盖', () => {
+test('基线快照自身完整性：两形态 × 54 id 全覆盖', () => {
   const ids = new Set(PATCH_SPECS.map((s) => s.id));
-  assert.equal(ids.size, 50);
+  assert.equal(ids.size, 54);
   for (const form of Object.keys(BASELINE)) {
-    assert.equal(Object.keys(BASELINE[form]).length, 50, `${form} 基线应覆盖 50 项`);
+    assert.equal(Object.keys(BASELINE[form]).length, 54, `${form} 基线应覆盖 54 项`);
     for (const id of Object.keys(BASELINE[form])) assert.ok(ids.has(id), `${form} 基线含未知 id ${id}`);
   }
 });

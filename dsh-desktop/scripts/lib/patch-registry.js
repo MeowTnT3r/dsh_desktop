@@ -50,6 +50,9 @@ const path = require('node:path');
 
 const {
   FLASH_PKG_REL,
+  CONVERSATION_PKG_REL,
+  SKILL_UI_PKG_REL,
+  WORKSPACE_PKG_REL,
   EXPOSE_PKG_REL,
   SLOT_KEY_COMPAT_PKG_REL,
   SLOT_UNKEYED_COMPAT_PKG_REL,
@@ -88,6 +91,7 @@ const {
   transformProfileBundleProfileBoot,
   transformSettingsSectionGuard,
   transformWorkspaceSearchRailFix,
+  transformManualSortFix,
   transformPluginInventoryTabMergeFix,
   transformPersistentShellAbortRace,
   transformTerminalInterruptEscalation,
@@ -110,6 +114,9 @@ const {
   transformSessionEventBound,
   transformSessionHeaderScanGuard,
   transformSessionLoadGraceful,
+  transformLoadAllHistory,
+  transformLoadAllHistoryUi,
+  transformSkillUiZh,
   rootAppliers,
 } = require('./patch-adapters');
 
@@ -125,6 +132,7 @@ const {
   PROFILE_BOOT_GUARD_MARKER,
   SETTINGS_SECTION_MARKER,
   WORKSPACE_SEARCH_RAIL_MARKER,
+  MANUAL_SORT_DRAG_MARKER,
   PLUGIN_INVENTORY_TAB_MARKER,
   PERSISTENT_ABORT_RACE_MARKER,
   INTERRUPT_ESCALATION_MARKER,
@@ -141,6 +149,9 @@ const {
   SESSION_EVENT_BOUND_MARKER,
   SESSION_HEADER_SCAN_MARKER,
   SESSION_LOAD_GRACEFUL_MARKER,
+  LOAD_ALL_HISTORY_MARKER,
+  LOAD_ALL_HISTORY_UI_MARKER,
+  SKILL_UI_ZH_MARKER,
   LOADER_TREE_ISOLATION_MARKER,
   LOADER_ACTIVATION_ISOLATION_MARKER,
   FAIL_LOUD_ISOLATION_MARKER,
@@ -266,6 +277,59 @@ const PATCH_SPECS = [
       alreadyLog: alreadySkip,
       doneLog: (file) => '已绑定 Session events 有界保留 ' + file,
       failLog: (file, err) => 'Session events 有界保留补丁失败(' + file + '): ' + err.message,
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // 一键加载全部历史（K24）：Session.loadAllHistory() 分批自动加载完整个历史
+  // （每批 400 条、批间让帧、进度 + 10000 条保护上限 + 取消）。运行时侧，锚点
+  // 独立于 session-event-bound（K8）。cli:false（桌面壳 boot 应用，不参与 CLI
+  // 同步期）。
+  // -------------------------------------------------------------------------
+  {
+    id: 'load-all-history',
+    group: 'runtime',
+    order: 46,
+    kind: 'file',
+    layout: 'runtime-local',
+    wslLayout: 'wsl',
+    pkgRel: FLASH_PKG_REL,
+    transform: transformLoadAllHistory,
+    marker: LOAD_ALL_HISTORY_MARKER,
+    requires: [],
+    failPolicy: 'warn',
+    cli: false,
+    logs: {
+      prefix: '一键加载全部历史补丁',
+      alreadyLog: alreadySkip,
+      doneLog: (file) => '已注入 Session.loadAllHistory 到 ' + file,
+      failLog: (file, err) => '一键加载全部历史补丁失败(' + file + '): ' + err.message,
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // 一键加载全部历史 —— UI 侧（K24）：ConversationController.loadAllHistory /
+  // cancelLoadAllHistory + ChatView 按钮/进度/上限提示。只追加、不改 K22 自动
+  // 滚底与既有 loadOlder 逻辑。cli:false。
+  // -------------------------------------------------------------------------
+  {
+    id: 'load-all-history-ui',
+    group: 'runtime',
+    order: 47,
+    kind: 'file',
+    layout: 'runtime-local',
+    wslLayout: 'wsl',
+    pkgRel: CONVERSATION_PKG_REL,
+    transform: transformLoadAllHistoryUi,
+    marker: LOAD_ALL_HISTORY_UI_MARKER,
+    requires: [],
+    failPolicy: 'warn',
+    cli: false,
+    logs: {
+      prefix: '一键加载全部历史 UI 补丁',
+      alreadyLog: alreadySkip,
+      doneLog: (file) => '已注入加载全部历史按钮到 ' + file,
+      failLog: (file, err) => '一键加载全部历史 UI 补丁失败(' + file + '): ' + err.message,
     },
   },
 
@@ -647,7 +711,7 @@ const PATCH_SPECS = [
     kind: 'file',
     layout: 'guard',
     wslLayout: 'guard',
-    pkgRel: path.join('dsh-client-ui-workspace', 'lib', 'client.js'),
+    pkgRel: WORKSPACE_PKG_REL,
     transform: transformWorkspaceSearchRailFix,
     marker: WORKSPACE_SEARCH_RAIL_MARKER,
     requires: [],
@@ -658,6 +722,29 @@ const PATCH_SPECS = [
       alreadyLog: alreadySkip,
       doneLog: (file) => '已注入到 ' + file,
       failLog: (file, err) => 'workspace 搜索栏修复失败(' + file + '): ' + err.message,
+    },
+  },
+  // K25 手动排序拖拽失效修复：会话行 HTML5 拖拽在 React 18 批处理下 drag.active
+  // 未及时更新导致 dragover/drop 未 preventDefault → 拖拽无效。onDragStart 内
+  // flushSync 同步提交 drag 状态。只改会话行（node.id）拖拽起点，不动排序/持久化。
+  {
+    id: 'manual-sort-drag-fix',
+    group: 'runtime',
+    order: 149,
+    kind: 'file',
+    layout: 'runtime-local',
+    wslLayout: 'wsl',
+    pkgRel: WORKSPACE_PKG_REL,
+    transform: transformManualSortFix,
+    marker: MANUAL_SORT_DRAG_MARKER,
+    requires: [],
+    failPolicy: 'warn',
+    cli: false,
+    logs: {
+      prefix: '手动排序拖拽修复',
+      alreadyLog: alreadySkip,
+      doneLog: (file) => '已注入到 ' + file,
+      failLog: (file, err) => '手动排序拖拽修复失败(' + file + '): ' + err.message,
     },
   },
   // K1 根因修复（「credentials service is absent」桌面端偶发，2026-08）：
@@ -813,6 +900,34 @@ const PATCH_SPECS = [
       alreadyLog: alreadySkip,
       doneLog: (file) => '已隐藏「全部」只读清单 ' + file,
       failLog: (file, err) => '插件页标签合并失败(' + file + '): ' + err.message,
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // K27：skill 工具行「Skill」标题 /「Inspect」按钮硬编码英文，绕过 locale
+  // 词典。补丁改 t("row.title") / t("row.inspect") + zh/en 补齐键；工具名
+  // "skill" 与模型侧提示词（tool description / catalog system-reminder）不动。
+  // guard 布局（client bundle 四副本）、cli:false（桌面壳 boot 应用，CLI 同步
+  // 期不碰）。见 patch-adapters K27 注释。
+  // -------------------------------------------------------------------------
+  {
+    id: 'skill-ui-zh',
+    group: 'guard',
+    order: 161,
+    kind: 'file',
+    layout: 'guard',
+    wslLayout: 'guard',
+    pkgRel: SKILL_UI_PKG_REL,
+    transform: transformSkillUiZh,
+    marker: SKILL_UI_ZH_MARKER,
+    requires: [],
+    failPolicy: 'warn',
+    cli: false,
+    logs: {
+      prefix: 'skill 工具行汉化',
+      alreadyLog: alreadySkip,
+      doneLog: (file) => '已汉化 skill 工具行标题/按钮 ' + file,
+      failLog: (file, err) => 'skill 工具行汉化失败(' + file + '): ' + err.message,
     },
   },
 

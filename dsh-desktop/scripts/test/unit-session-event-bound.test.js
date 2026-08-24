@@ -33,6 +33,7 @@ const { transformSessionEventBound } = require('../lib/patch-adapters');
 
 const BOUND = 2000;
 const KEEP = 1200;
+const RUNNING_HARD_CAP = 6000;
 
 /** 定位内核 client.js 源：优先 pristine rc2 stage，回退真实 node_modules（当前未打补丁树）。 */
 function resolveClientSource() {
@@ -345,4 +346,67 @@ test('v4：baseSeq 偏移时 loadOlder 去重，防止重复事件进入窗口�
   // 历史回页 [9,10,11] 与现有窗口 [10,11] 重叠：10/11 被去重，仅前插 9。
   assert.deepEqual([...s.events.map((e) => e.seq)], [9, 10, 11], '重叠事件应去重，窗口不出现重复 seq');
   assert.equal(new Set(s.events.map((e) => e.seq)).size, s.events.length, 'events 内 seq 应唯一（后续 trim/replaceWindow 不再 duplicate start）');
+});
+
+// ---------------------------------------------------------------------------
+// K22 回归：流式期间（running=true）trim 暂缓，避免 replaceWindow 重建把上滚读者
+// 拉回底部。仅当超过 SESSION_EVENT_RUNNING_HARD_CAP 的紧急上限才兜底裁；turn 边界
+// （running=false）恢复照常裁回 KEEP。
+// ---------------------------------------------------------------------------
+
+test('K22：transform 注入 running 门控 + 紧急硬上限（内容契约 + 幂等）', () => {
+  assert.ok(hasSource, '缺内核 client.js 源（.tmp-rc2-stage 或 node_modules）');
+  const pristine = fs.readFileSync(CLIENT_PATH, 'utf8');
+  const r = transformSessionEventBound(pristine, 'client.js');
+  assert.equal(r.status, 'changed', '未打补丁源应 changed');
+  const src = r.src;
+  assert.ok(src.includes('const SESSION_EVENT_RUNNING_HARD_CAP = 6000;'), '应注入 running 紧急硬上限常量');
+  assert.ok(
+    src.includes('if (this.running === true && this.events.length <= SESSION_EVENT_RUNNING_HARD_CAP) return;'),
+    '应注入 running 门控（流式期间暂缓 trim）',
+  );
+  // 门控必须位于 trimSessionWindow 内、且在 BOUND 早退之后。
+  const trimStart = src.indexOf('trimSessionWindow() {');
+  const boundIdx = src.indexOf('if (this.events.length <= SESSION_EVENT_BOUND) return;', trimStart);
+  const guardIdx = src.indexOf('if (this.running === true', trimStart);
+  assert.ok(boundIdx > trimStart && guardIdx > boundIdx, 'running 门控应位于 trimSessionWindow 内、BOUND 早退之后');
+  // 幂等：二次 transform already。
+  assert.equal(transformSessionEventBound(src, 'client.js').status, 'already');
+});
+
+test('K22：running=true 流式期间 trim 暂缓，超硬上限才紧急裁', { skip: !hasSource }, () => {
+  const pristine = fs.readFileSync(CLIENT_PATH, 'utf8');
+  const patched = transformSessionEventBound(pristine, 'client.js').src;
+  const mod = loadClientModule(patched);
+  const s = makeSession(mod);
+  s.handleRunning(true);
+
+  // 超过 BOUND 但低于硬上限：running 期间不裁（用户可安心上滚读历史）。
+  for (let i = 1; i <= BOUND + 500; i += 1) s.appendLive(eventAt(i, 50), undefined);
+  assert.equal(s.events.length, BOUND + 500, 'running 期间超 BOUND 不应裁');
+  assert.equal(s.hasMore, false, '未裁则 hasMore 不 flip');
+
+  // 冲过硬上限：紧急兜底裁一次，hasMore flip。
+  for (let i = BOUND + 501; i <= RUNNING_HARD_CAP + 500; i += 1) s.appendLive(eventAt(i, 50), undefined);
+  assert.ok(s.events.length < RUNNING_HARD_CAP, `超硬上限后应紧急裁，实际 ${s.events.length}`);
+  assert.equal(s.hasMore, true, '紧急裁后 hasMore 应 flip true');
+  assert.equal(s.events[0].type, 'turn/start', '紧急裁首事件仍对齐 turn/start 边界');
+});
+
+test('K22：running 翻 false 后 trim 恢复（turn 边界照常裁回有界窗口）', { skip: !hasSource }, () => {
+  const pristine = fs.readFileSync(CLIENT_PATH, 'utf8');
+  const patched = transformSessionEventBound(pristine, 'client.js').src;
+  const mod = loadClientModule(patched);
+  const s = makeSession(mod);
+  s.handleRunning(true);
+
+  // 流式期间累积到超过 BOUND（未达硬上限）→ 不裁。
+  for (let i = 1; i <= BOUND + 500; i += 1) s.appendLive(eventAt(i, 50), undefined);
+  assert.ok(s.events.length > BOUND, 'running 期间超 BOUND 不裁');
+
+  // turn 结束：running=false，下一次 append 恢复裁到有界窗口。
+  s.handleRunning(false);
+  s.appendLive(eventAt(BOUND + 501, 50), undefined);
+  assert.ok(s.events.length <= BOUND, `running=false 后应恢复 trim，实际 ${s.events.length}`);
+  assert.equal(s.hasMore, true, '恢复 trim 后 hasMore 应 flip true');
 });

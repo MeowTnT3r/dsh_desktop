@@ -98,8 +98,8 @@ const MULTI_SITE = new Set([
 const fileSpecs = PATCH_SPECS.filter((s) => s.kind === 'file');
 const rootSpecs = PATCH_SPECS.filter((s) => s.kind === 'root');
 
-test('审计 1：分类覆盖全部 35 个 file transform（无回滚盲区）', () => {
-  assert.equal(fileSpecs.length, 35);
+test('审计 1：分类覆盖全部 39 个 file transform（无回滚盲区）', () => {
+  assert.equal(fileSpecs.length, 39);
   const report = [];
   for (const spec of fileSpecs) {
     const pair = INVERSE_PAIR_HINTS[spec.id];

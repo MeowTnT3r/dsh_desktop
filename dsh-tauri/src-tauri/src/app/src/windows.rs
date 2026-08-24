@@ -142,7 +142,12 @@ pub fn hide_main_to_tray(win: &tauri::WebviewWindow) {
 }
 
 /// 浮窗（分屏）：同会话复用 + 上限 FLOAT_MAX。
-pub fn open_float_window(app: &tauri::AppHandle, kernel_url: &str, session_id: &str) -> Result<serde_json::Value, BridgeError> {
+///
+/// K23 卡死根治：WebView2 建窗必须在独立线程——同步 command（float_window）
+/// 里 `build()` 会在 Windows 上死锁（Tauri 2 官方 Known issues；赞助窗 v0.5.0
+/// 三症同源已修，浮窗/宠物窗此前漏改）。复用/FLOAT_MAX/URL 校验仍同步返回，
+/// 只有建窗 + show 移入独立线程（与赞助窗/更新进度弹窗同款模式）。
+pub fn open_float_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, kernel_url: &str, session_id: &str) -> Result<serde_json::Value, BridgeError> {
     let label = float_label(session_id);
     if let Some(existing) = app.get_webview_window(&label) {
         let _ = existing.show();
@@ -153,31 +158,56 @@ pub fn open_float_window(app: &tauri::AppHandle, kernel_url: &str, session_id: &
     if floats >= FLOAT_MAX {
         return Err(BridgeError::not_found(format!("浮窗已达上限 {FLOAT_MAX}")));
     }
+    // 同步校验 URL：非法立即报错，不落入线程静默失败（白屏）。
     let url = kernel_url.trim_end_matches('/').to_string();
+    let parsed = parse_url(&url)?;
     let mode_script = format!(
         r#"(function(){{ try{{ window.__DSH_FLOAT__ = Object.freeze({{ sessionId: {session_id_json} }}); }}catch(e){{}} }})();"#,
         session_id_json = serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".into())
     );
     let preset_script = float_session_preset(session_id);
-    let win = tauri::webview::WebviewWindowBuilder::new(
-        app,
-        &label,
-        WebviewUrl::External(parse_url(&url)?),
-    )
-    .title("DSH 会话")
-    .inner_size(900.0, 640.0)
-    .min_inner_size(480.0, 360.0)
-    .decorations(false)
-    .initialization_script(BRIDGE_SHIM_JS)
-    .initialization_script(&mode_script)
-    .initialization_script(&preset_script)
-    .initialization_script(FLOAT_BAR_SCRIPT)
-    .initialization_script(FLOAT_WATCHDOG_SCRIPT)
-    .on_navigation(|url| url.as_str().starts_with("http://127.0.0.1"))
-    .build()
-    .map_err(|e| BridgeError::internal(format!("浮窗创建: {e}")))?;
-    let _ = win.show();
-    Ok(serde_json::json!({ "ok": true }))
+    let handle = app.clone();
+    std::thread::Builder::new()
+        .name(format!("float-window-{label}"))
+        .spawn(move || {
+            // 双击竞态复检：两个线程同时过了外层检查时，后来者只聚焦。
+            if let Some(existing) = handle.get_webview_window(&label) {
+                let _ = existing.show();
+                let _ = existing.set_focus();
+                return;
+            }
+            match build_float_window(&handle, &label, parsed, &mode_script, &preset_script) {
+                Ok(win) => {
+                    let _ = win.show();
+                }
+                Err(e) => eprintln!("[float] 浮窗创建失败（不影响主窗）: {e}"),
+            }
+        })
+        .map_err(|e| BridgeError::internal(format!("浮窗线程启动: {e}")))?;
+    Ok(serde_json::json!({ "ok": true, "async": true }))
+}
+
+/// 浮窗构造（独立函数供集成测试复用——mock runtime 下走与生产完全
+/// 同款的 builder 路径，验证窗口属性与销毁）。泛型 R 兼容 Wry/MockRuntime。
+pub fn build_float_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+    url: tauri::Url,
+    mode_script: &str,
+    preset_script: &str,
+) -> Result<tauri::WebviewWindow<R>, tauri::Error> {
+    tauri::webview::WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
+        .title("DSH 会话")
+        .inner_size(900.0, 640.0)
+        .min_inner_size(480.0, 360.0)
+        .decorations(false)
+        .initialization_script(BRIDGE_SHIM_JS)
+        .initialization_script(mode_script)
+        .initialization_script(preset_script)
+        .initialization_script(FLOAT_BAR_SCRIPT)
+        .initialization_script(FLOAT_WATCHDOG_SCRIPT)
+        .on_navigation(|url| url.as_str().starts_with("http://127.0.0.1"))
+        .build()
 }
 
 /// URL 解析 helper。
@@ -318,19 +348,54 @@ pub fn should_open_pet_on_minimize(auto_open: bool, pet_exists: bool) -> bool {
 }
 
 /// 宠物窗：透明置顶小窗。WebView2 透明窗为已知风险点（roadmap R2）——
-/// 创建失败时返回错误（调用方降级提示），不拖垮主流程。
-pub fn open_pet_window(app: &tauri::AppHandle, kernel_url: &str) -> Result<serde_json::Value, BridgeError> {
+/// 创建失败仅日志，不拖垮主流程。
+///
+/// K23 卡死根治：建窗必须在独立线程——同步 command（pet_window）与主窗
+/// on_window_event（最小化自动弹宠物窗 G3）里 `build()` 都会在 Windows 上
+/// 死锁（Tauri 2 官方 Known issues）。复用/URL 校验同步返回，建窗 + show +
+/// pet-state 事件移入独立线程（与赞助窗/更新进度弹窗同款模式）。
+pub fn open_pet_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, kernel_url: &str) -> Result<serde_json::Value, BridgeError> {
     if let Some(existing) = app.get_webview_window("pet") {
         let _ = existing.show();
         let _ = existing.set_focus();
         return Ok(serde_json::json!({ "ok": true, "open": true, "reused": true }));
     }
+    // 同步校验 URL：非法立即报错，不落入线程静默失败（白屏）。
     let url = kernel_url.trim_end_matches('/').to_string();
-    let _seq = PET_SEQ.fetch_add(1, Ordering::Relaxed);
+    let parsed = parse_url(&url)?;
+    let handle = app.clone();
+    std::thread::Builder::new()
+        .name("pet-window".into())
+        .spawn(move || {
+            // 双击竞态复检：两个线程同时过了外层检查时，后来者只聚焦。
+            if let Some(existing) = handle.get_webview_window("pet") {
+                let _ = existing.show();
+                let _ = existing.set_focus();
+                return;
+            }
+            let _seq = PET_SEQ.fetch_add(1, Ordering::Relaxed);
+            match build_pet_window(&handle, parsed) {
+                Ok(win) => {
+                    let _ = win.show();
+                    let _ = handle.emit("pet-state", serde_json::json!({ "open": true }));
+                }
+                Err(e) => eprintln!("[pet] 宠物窗创建失败（不影响主窗）: {e}"),
+            }
+        })
+        .map_err(|e| BridgeError::internal(format!("宠物窗线程启动: {e}")))?;
+    Ok(serde_json::json!({ "ok": true, "open": true, "async": true }))
+}
+
+/// 宠物窗构造（独立函数供集成测试复用——mock runtime 下走与生产完全
+/// 同款的 builder 路径，验证窗口属性与销毁）。泛型 R 兼容 Wry/MockRuntime。
+pub fn build_pet_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: tauri::Url,
+) -> Result<tauri::WebviewWindow<R>, tauri::Error> {
     let b = tauri::webview::WebviewWindowBuilder::new(
         app,
         "pet",
-        WebviewUrl::External(parse_url(&url)?),
+        WebviewUrl::External(url),
     )
     .title("DSH 宠物")
     .inner_size(PET_W, PET_H)
@@ -341,20 +406,16 @@ pub fn open_pet_window(app: &tauri::AppHandle, kernel_url: &str) -> Result<serde
     // 默认即不透明（宠物窗有实底色，视觉降级可接受）。
     #[cfg(target_os = "windows")]
     let b = b.transparent(true);
-    let b = b
-    .always_on_top(true)
+    b.always_on_top(true)
     .skip_taskbar(true)
     .resizable(false)
     .maximizable(false)
     .shadow(false)
     .initialization_script(BRIDGE_SHIM_JS)
     .initialization_script(PET_MODE_SCRIPT)
+    .initialization_script(PET_WATCHDOG_SCRIPT)
     .on_navigation(|url| url.as_str().starts_with("http://127.0.0.1"))
     .build()
-    .map_err(|e| BridgeError::internal(format!("宠物窗创建（WebView2 透明窗已知风险）: {e}")))?;
-    let _ = b.show();
-    let _ = app.emit("pet-state", serde_json::json!({ "open": true }));
-    Ok(serde_json::json!({ "ok": true, "open": true }))
 }
 
 /// 宠物窗模式注入：__DSH_PET__ + 隐藏非宠物节点 + 透明背景（DOMContentLoaded）。
@@ -368,6 +429,41 @@ const PET_MODE_SCRIPT: &str = r#"
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', inject);
   else inject();
+})();
+"#;
+
+/// 宠物窗白屏看门狗（K23，对齐 FW1 浮窗看门狗）：
+/// - initialization_script 通道（每次导航/reload 必执行），about:blank 预导航
+///   文档直接跳过（protocol 守卫）；
+/// - 3s 后 body 仍无任何子元素（内核页未监听/重启窗口期导航失败 → 白窗）
+///   → 自动 reload 一次（sessionStorage 记次数，每窗最多一次）；
+/// - reload 后 3s 仍死 → 关闭宠物窗（160×160 透明小窗无内容即无意义，
+///   绝不留白窗；宠物窗白屏此前无任何兜底——FW1 只覆盖了浮窗）。
+const PET_WATCHDOG_SCRIPT: &str = r#"
+(function(){
+  if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
+  var FLAG = '__dsh_pet_watchdog_reloaded__';
+  function flag(){
+    try { return sessionStorage.getItem(FLAG) === '1'; } catch (e) { return false; }
+  }
+  function setFlag(v){
+    try { if (v) sessionStorage.setItem(FLAG, '1'); else sessionStorage.removeItem(FLAG); } catch (e) {}
+  }
+  function alive(){
+    try { return !!(document.body && document.body.childElementCount > 0); } catch (e) { return false; }
+  }
+  function closeWin(){
+    try {
+      if (window.dshDesktop && window.dshDesktop.petWindow && window.dshDesktop.petWindow.close) {
+        window.dshDesktop.petWindow.close();
+      } else if (window.close) { window.close(); }
+    } catch (e) {}
+  }
+  setTimeout(function(){
+    if (alive()) { setFlag(false); return; }
+    if (!flag()) { setFlag(true); location.reload(); return; }
+    closeWin();
+  }, 3000);
 })();
 "#;
 
@@ -893,11 +989,71 @@ mod tests {
     fn float_window_builder_wires_watchdog_shape() {
         let src = include_str!("windows.rs");
         let seg = src
-            .split("pub fn open_float_window")
+            .split("pub fn build_float_window")
             .nth(1)
             .and_then(|s| s.split("/// URL 解析 helper").next())
-            .expect("open_float_window 函数体");
+            .expect("build_float_window 函数体");
         assert!(seg.contains(".initialization_script(FLOAT_WATCHDOG_SCRIPT)"), "浮窗必须注入看门狗: {seg}");
+        assert!(seg.contains(".initialization_script(BRIDGE_SHIM_JS)"), "桥垫片不得回退丢失: {seg}");
+    }
+
+    /// K23：浮窗建窗必须移入独立线程（同步 command 里 build() 在 Windows 死锁——
+    /// Tauri 2 官方 Known issues）。open_float_window 只做复用/上限/URL 同步校验，
+    /// 建窗 + show 全在 std::thread 线程内。
+    #[test]
+    fn float_window_creation_threaded_shape() {
+        let src = include_str!("windows.rs");
+        let seg = src
+            .split("pub fn open_float_window")
+            .nth(1)
+            .and_then(|s| s.split("pub fn build_float_window").next())
+            .expect("open_float_window 函数体");
+        assert!(seg.contains("std::thread::Builder"), "浮窗建窗必须移出同步 command 线程: {seg}");
+        assert!(seg.contains("build_float_window(&handle"), "必须经 build_float_window 建窗: {seg}");
+        assert!(seg.contains("parse_url(&url)?"), "URL 必须同步校验（非法立即报错不白屏）: {seg}");
+    }
+
+    /// K23：宠物窗建窗必须移入独立线程（同步 command + 主窗 on_window_event
+    /// 最小化自动弹宠物窗里 build() 都在 Windows 死锁）。open_pet_window 只做
+    /// 复用/URL 同步校验，建窗 + show + pet-state 全在 std::thread 线程内。
+    #[test]
+    fn pet_window_creation_threaded_shape() {
+        let src = include_str!("windows.rs");
+        let seg = src
+            .split("pub fn open_pet_window")
+            .nth(1)
+            .and_then(|s| s.split("pub fn build_pet_window").next())
+            .expect("open_pet_window 函数体");
+        assert!(seg.contains("std::thread::Builder"), "宠物窗建窗必须移出同步 command/事件线程: {seg}");
+        assert!(seg.contains("build_pet_window(&handle"), "必须经 build_pet_window 建窗: {seg}");
+        assert!(seg.contains("parse_url(&url)?"), "URL 必须同步校验（非法立即报错不白屏）: {seg}");
+    }
+
+    /// K23 宠物窗白屏看门狗形态锚点（对齐 FW1 浮窗看门狗）：
+    /// - 3s 活性探测 + reload 恰好一次（sessionStorage 防抖）+ 二次失败关窗；
+    /// - about:blank 预导航守卫（protocol 守卫）；
+    /// - 关窗走桥 petWindow.close 优先，退化 window.close。
+    #[test]
+    fn pet_watchdog_script_shape() {
+        assert!(PET_WATCHDOG_SCRIPT.contains("3000"), "3s 活性探测: {PET_WATCHDOG_SCRIPT}");
+        assert!(PET_WATCHDOG_SCRIPT.contains("location.reload()"), "死后必须自动 reload: {PET_WATCHDOG_SCRIPT}");
+        assert!(PET_WATCHDOG_SCRIPT.contains("__dsh_pet_watchdog_reloaded__"), "reload 只做一次（标记）: {PET_WATCHDOG_SCRIPT}");
+        assert!(PET_WATCHDOG_SCRIPT.contains("petWindow.close"), "二次失败关窗（桥优先）: {PET_WATCHDOG_SCRIPT}");
+        assert!(PET_WATCHDOG_SCRIPT.contains("location.protocol"), "预导航 about:blank 守卫: {PET_WATCHDOG_SCRIPT}");
+        assert!(PET_WATCHDOG_SCRIPT.contains("childElementCount"), "活性探测盯 body 子元素: {PET_WATCHDOG_SCRIPT}");
+    }
+
+    /// 宠物窗看门狗必须接进 builder（initialization_script 通道，reload 后仍生效）。
+    #[test]
+    fn pet_window_builder_wires_watchdog_shape() {
+        let src = include_str!("windows.rs");
+        let seg = src
+            .split("pub fn build_pet_window")
+            .nth(1)
+            .and_then(|s| s.split("/// 宠物窗模式注入").next())
+            .expect("build_pet_window 函数体");
+        assert!(seg.contains(".initialization_script(PET_WATCHDOG_SCRIPT)"), "宠物窗必须注入看门狗: {seg}");
+        assert!(seg.contains(".initialization_script(PET_MODE_SCRIPT)"), "宠物模式注入不得回退丢失: {seg}");
         assert!(seg.contains(".initialization_script(BRIDGE_SHIM_JS)"), "桥垫片不得回退丢失: {seg}");
     }
 

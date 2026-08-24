@@ -23,6 +23,11 @@ const path = require('node:path');
 
 /** 各补丁目标包内的相对路径（@deepseek-ai/<rel>）。 */
 const FLASH_PKG_REL = path.join('dsh-client-runtime', 'lib', 'client.js');
+const CONVERSATION_PKG_REL = path.join('dsh-client-ui-conversation', 'lib', 'client.js');
+const SKILL_UI_PKG_REL = path.join('dsh-client-ui-skill', 'lib', 'client.js');
+// K25：会话分组「手动排序」拖拽失效修复补丁目标（ViewOptionsMenu /
+// SessionNodeItem / commitSessionDrag 所在入口）。
+const WORKSPACE_PKG_REL = path.join('dsh-client-ui-workspace', 'lib', 'client.js');
 const EXPOSE_PKG_REL = path.join('dsh-host-apiproxy', 'lib', 'index.js');
 const PERSISTENCE_PKG_REL = path.join('dsh-session-persistence-jsonl', 'lib', 'index.js');
 const SLOT_KEY_COMPAT_PKG_REL = path.join('dsh-client-ui-slots', 'lib', 'index.js');
@@ -220,6 +225,9 @@ function slotCompatPatchTargets(home) {
 module.exports = {
   LAYOUTS,
   FLASH_PKG_REL,
+  CONVERSATION_PKG_REL,
+  SKILL_UI_PKG_REL,
+  WORKSPACE_PKG_REL,
   EXPOSE_PKG_REL,
   PERSISTENCE_PKG_REL,
   SLOT_KEY_COMPAT_PKG_REL,

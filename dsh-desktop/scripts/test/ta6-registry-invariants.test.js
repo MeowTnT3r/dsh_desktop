@@ -45,7 +45,7 @@ const IMPL_SOURCES = [
  * 历史漂移（缺陷记录：路径常量未收口，加新条目到此白名单 = 掩盖漂移）。 */
 const INLINE_PKG_REL_SPEC_IDS = new Set([
   'settings-section-guard',
-  'workspace-search-rail-fix',
+  // workspace-search-rail-fix 已收口到 WORKSPACE_PKG_REL（K25），移出白名单。
   'credentials-initial-retry',
   // credentials-absent-guidance 的内联 pkgRel 与 EXPOSE_PKG_REL 同值，视为已覆盖。
   'device-auth-guidance',
@@ -146,8 +146,8 @@ test('D. pkgRel/pkgRels 被 patch-target-resolver 常量覆盖（白名单外新
 });
 
 test('E. order 全局唯一、组内升序、补丁间依赖序成立', () => {
-  // 50 = 49（上一基线）+ empty-tool-name-guidance（root，order 247）。
-  assert.equal(PATCH_SPECS.length, 50, 'spec 总数应为 50');
+  // 53 = 52（上一基线）+ manual-sort-drag-fix（K25，order 149）。
+  assert.equal(PATCH_SPECS.length, 54, 'spec 总数应为 54');
   const orders = PATCH_SPECS.map((s) => s.order);
   assert.equal(new Set(orders).size, orders.length, 'order 必须全局唯一');
   const byId = Object.fromEntries(PATCH_SPECS.map((s) => [s.id, s]));

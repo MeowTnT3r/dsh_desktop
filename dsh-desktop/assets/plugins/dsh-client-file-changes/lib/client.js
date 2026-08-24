@@ -19,20 +19,139 @@ window.__ModuleLoader__.load({
 		 *     点击文件在壳层中通过系统默认程序打开（window.dshDesktop.openPath）。
 		 */
 
-		/** 简单行级 diff：公共前缀/后缀裁剪，中间部分作为变更块。 */
-		function lineDiff(oldText, newText) {
-			const a = String(oldText || "").split("\n");
-			const b = String(newText || "").split("\n");
+		/** 按行拆分文本；空文本 → 空数组（避免 create/delete 产生空白占位行）。 */
+		function splitLines(text) {
+			const s = String(text == null ? "" : text);
+			return s === "" ? [] : s.split("\n");
+		}
+
+		/**
+		 * 三分类行级 diff：公共前缀/后缀裁剪，中间变更块内「成对」的删除/新增
+		 * 行标记为「修改」(mod，黄色)——旧行与新行各自成行、先旧后新；多出的
+		 * 行仍归为纯「删除」(del，红) / 「新增」(add，绿)。
+		 * 返回 [{ kind: 'ctx'|'del'|'add'|'mod', text }]，'mod' 恒成对出现。
+		 */
+		function diffRows(oldText, newText) {
+			const a = splitLines(oldText);
+			const b = splitLines(newText);
 			let p = 0;
 			while (p < a.length && p < b.length && a[p] === b[p]) p++;
-			let sa = a.length - 1, sb = b.length - 1;
-			while (sa >= p && sb >= p && a[sa] === b[sb]) { sa--; sb--; }
-			return {
-				contextBefore: a.slice(Math.max(0, p - 3), p),
-				removed: a.slice(p, sa + 1),
-				added: b.slice(p, sb + 1),
-				contextAfter: b.slice(sb + 1, sb + 4)
-			};
+			let sa = a.length, sb = b.length;
+			while (sa > p && sb > p && a[sa - 1] === b[sb - 1]) { sa--; sb--; }
+			const rows = [];
+			for (let i = Math.max(0, p - 3); i < p; i++) rows.push({ kind: "ctx", text: a[i] });
+			const removed = a.slice(p, sa);
+			const added = b.slice(p, sb);
+			const m = Math.min(removed.length, added.length);
+			for (let i = 0; i < m; i++) rows.push({ kind: "mod", text: removed[i] });
+			for (let i = 0; i < m; i++) rows.push({ kind: "mod", text: added[i] });
+			for (let i = m; i < removed.length; i++) rows.push({ kind: "del", text: removed[i] });
+			for (let i = m; i < added.length; i++) rows.push({ kind: "add", text: added[i] });
+			for (let i = sb; i < Math.min(sb + 3, b.length); i++) rows.push({ kind: "ctx", text: b[i] });
+			return rows;
+		}
+
+		/** 由 diffRows 的行计算统计：新增/删除/修改（mod 成对，各计一次）。 */
+		function diffStats(rows) {
+			let add = 0, del = 0, mod = 0;
+			for (const r of rows) {
+				if (r.kind === "add") add++;
+				else if (r.kind === "del") del++;
+				else if (r.kind === "mod") mod++;
+			}
+			const pairs = mod / 2;
+			return { add, del, mod: pairs, added: add + pairs, removed: del + pairs };
+		}
+
+	/** diff 行类型 → 展示 class 后缀（ctx/del/add/mod）。 */
+	function diffKindClass(kind) {
+		return kind === "ctx" ? "dsh-fc-ctx"
+			: kind === "del" ? "dsh-fc-del"
+			: kind === "add" ? "dsh-fc-add"
+			: "dsh-fc-mod";
+	}
+
+	/**
+	 * 内嵌覆盖行分类：把 newText 的「每一行」映射到一种高亮类型，供侧边栏
+	 * 编辑器在「当前文件内容」之上叠加改动行着色（绿新增 / 黄修改）。
+	 * 用 LCS（最长公共子序列）做行级对齐，比 diffRows 的前缀/后缀裁剪更准
+	 * （中段插入/删除不会错位）；超大输入退回前缀/后缀启发式（O(n+m)）控内存。
+	 * 被整行删除的行（红）已不在文件里，只计数不渲染。
+	 * 返回 { kinds, removed, added, changed }：
+	 *   kinds   — ('ctx'|'add'|'mod')[]，长度 === splitLines(newText).length
+	 *   removed — 整行删除数（红）
+	 *   added   — 整行新增数（绿）
+	 *   changed — 成对 old→new 修改数（黄）
+	 */
+	function highlightNewLines(oldText, newText) {
+		const a = splitLines(oldText);
+		const b = splitLines(newText);
+		if (b.length === 0) return { kinds: [], removed: a.length, added: 0, changed: 0 };
+		if (a.length === 0) return { kinds: b.map(() => "add"), removed: 0, added: b.length, changed: 0 };
+		if (a.length * b.length > 4_000_000) return highlightNewLinesFast(a, b);
+		const n = a.length, m = b.length;
+		const dp = [];
+		for (let i = 0; i <= n; i++) dp.push(new Uint16Array(m + 1));
+		for (let i = n - 1; i >= 0; i--) {
+			const ai = a[i], row = dp[i], next = dp[i + 1];
+			for (let j = m - 1; j >= 0; j--) {
+				row[j] = ai === b[j] ? next[j + 1] + 1 : (next[j] >= row[j + 1] ? next[j] : row[j + 1]);
+			}
+		}
+		// 回溯成 ops（0=eq / -1=del / 1=ins），再按「del 紧邻 ins → mod 对」分类。
+		const ops = [];
+		let i = 0, j = 0;
+		while (i < n && j < m) {
+			if (a[i] === b[j]) { ops.push(0); i++; j++; }
+			else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push(-1); i++; }
+			else { ops.push(1); j++; }
+		}
+		while (i < n) { ops.push(-1); i++; }
+		while (j < m) { ops.push(1); j++; }
+		const kinds = [];
+		let removed = 0, added = 0, changed = 0;
+		for (let k = 0; k < ops.length; k++) {
+			const op = ops[k];
+			if (op === 0) { kinds.push("ctx"); continue; }
+			if (op === -1) {
+				if (k + 1 < ops.length && ops[k + 1] === 1) { changed++; kinds.push("mod"); k++; }
+				else removed++;
+			} else {
+				kinds.push("add"); added++;
+			}
+		}
+		return { kinds, removed, added, changed };
+	}
+
+	/** 前缀/后缀裁剪 + 成对 mod 的启发式（超大输入回退，O(n+m)）。 */
+	function highlightNewLinesFast(a, b) {
+		let p = 0;
+		while (p < a.length && p < b.length && a[p] === b[p]) p++;
+		let sa = a.length, sb = b.length;
+		while (sa > p && sb > p && a[sa - 1] === b[sb - 1]) { sa--; sb--; }
+		const removedMid = a.slice(p, sa);
+		const addedMid = b.slice(p, sb);
+		const m = Math.min(removedMid.length, addedMid.length);
+		const kinds = [];
+		for (let i = 0; i < p; i++) kinds.push("ctx");
+		for (let i = 0; i < m; i++) kinds.push("mod");
+		for (let i = m; i < addedMid.length; i++) kinds.push("add");
+		for (let i = sb; i < b.length; i++) kinds.push("ctx");
+		return {
+			kinds,
+			removed: removedMid.length - m,
+			added: addedMid.length - m,
+			changed: m
+		};
+	}
+
+		/** 渲染一串 diff 行（三分类高亮：绿增/红删/黄改/灰上下文）。 */
+		function DiffLines({ rows, prefix }) {
+			return rows.map((r, i) => react_jsx_runtime.jsx("div", {
+				className: "dsh-fc-line " + diffKindClass(r.kind),
+				key: prefix + i,
+				children: r.kind === "ctx" ? (r.text || " ") : (r.text || " ").slice(0, 400)
+			}));
 		}
 
 		const OP_LABEL = { create: "新建", edit: "修改", delete: "删除" };
@@ -51,23 +170,105 @@ window.__ModuleLoader__.load({
 			return String(p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 		}
 
-		/** 按路径聚合：首条 oldText → 末条 newText 的累计视图；还原时按逆序下发。 */
-		function groupChanges(changes) {
-			const map = new Map();
-			for (const c of changes) {
-				const entry = map.get(c.path) || { path: c.path, items: [], first: c, last: c };
-				entry.items.push(c);
-				entry.last = c;
-				map.set(c.path, entry);
-			}
-			return [...map.values()];
+	/** 按路径聚合：首条 oldText → 末条 newText 的累计视图；还原时按逆序下发。 */
+	function groupChanges(changes) {
+		const map = new Map();
+		for (const c of changes) {
+			const entry = map.get(c.path) || { path: c.path, items: [], first: c, last: c };
+			entry.items.push(c);
+			entry.last = c;
+			map.set(c.path, entry);
+		}
+		return [...map.values()];
+	}
+
+	/**
+	 * 按 path 查询本会话的改动高亮（侧边栏编辑器内嵌叠加用）。把命中的全部
+	 * 变更折叠成「首条 oldText → 末条 newText」累计视图，再经 highlightNewLines
+	 * 对「当前文件每一行」分类。路径比较经 normPath 归一（分隔符统一 + Windows
+	 * 大小写不敏感）。无命中返回 { present: false }。
+	 */
+	function queryFileHighlight(changes, path) {
+		const target = normPath(path);
+		const matches = [];
+		for (const c of changes) {
+			if (normPath(c.path) === target) matches.push(c);
+		}
+		if (matches.length === 0) return { present: false };
+		const first = matches[0];
+		const last = matches[matches.length - 1];
+		const hl = highlightNewLines(first.oldText, last.op === "delete" ? "" : last.newText);
+		return {
+			present: true,
+			op: last.op,
+			seq: last.seq,
+			time: last.time,
+			path: last.path,
+			count: matches.length,
+			kinds: hl.kinds,
+			removed: hl.removed,
+			added: hl.added,
+			changed: hl.changed
+		};
+	}
+
+		/** 时间戳 → 本地 HH:MM:SS（跨平台稳定；测试不依赖本地化格式）。 */
+		function formatTime(ms) {
+			const d = new Date(ms);
+			const p = (n) => String(n).padStart(2, "0");
+			return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+		}
+
+		/** 单条变更记录（diff 历史）：op 徽标 + 时间 + 改动前→后三分类 diff。 */
+		function ChangeRecord({ item, index }) {
+			const [open, setOpen] = react.useState(false);
+			const rows = diffRows(item.oldText, item.newText);
+			const stats = diffStats(rows);
+			const label = OP_LABEL[item.op] || item.op;
+			return react_jsx_runtime.jsxs("div", {
+				className: "dsh-fc-hist-item" + (open ? " dsh-fc-hist-open" : ""),
+				children: [
+					react_jsx_runtime.jsxs("div", {
+						className: "dsh-fc-hist-row",
+						onClick: () => setOpen((v) => !v),
+						children: [
+							react_jsx_runtime.jsx("button", {
+								className: "dsh-fc-hist-toggle",
+								onClick: (e) => { e.stopPropagation(); setOpen((v) => !v); },
+								children: open ? "▾" : "▸"
+							}),
+							react_jsx_runtime.jsx("span", {
+								className: "dsh-fc-hist-seq",
+								children: "#" + (index + 1)
+							}),
+							react_jsx_runtime.jsx("span", {
+								className: "dsh-fc-badge dsh-fc-" + item.op,
+								children: label
+							}),
+							react_jsx_runtime.jsx("span", {
+								className: "dsh-fc-hist-time",
+								children: formatTime(item.time)
+							}),
+							react_jsx_runtime.jsxs("span", {
+								className: "dsh-fc-count",
+								children: ["+", stats.added, " −", stats.removed]
+							})
+						]
+					}),
+					open && react_jsx_runtime.jsx("div", {
+						className: "dsh-fc-hist-diff",
+						children: react_jsx_runtime.jsx(DiffLines, { rows, prefix: "h" + index + "-" })
+					})
+				]
+			});
 		}
 
 		function FileRow({ entry, onRevert, busy, feedback }) {
 			const [open, setOpen] = react.useState(false);
 			const first = entry.first, last = entry.last;
-			const diff = lineDiff(first.oldText, last.op === "delete" ? "" : last.newText);
-			const total = diff.removed.length + diff.added.length;
+			const rows = diffRows(first.oldText, last.op === "delete" ? "" : last.newText);
+			const stats = diffStats(rows);
+			const total = stats.added + stats.removed;
 			const fb = feedback && feedback[entry.path];
 			const reverted = fb && fb.status === "reverted";
 			const canPreview = last.op !== "delete" && /\.html?$/i.test(basename(entry.path));
@@ -101,7 +302,7 @@ window.__ModuleLoader__.load({
 									}),
 									total > 0 && react_jsx_runtime.jsxs("span", {
 										className: "dsh-fc-count",
-										children: ["+", diff.added.length, " −", diff.removed.length]
+										children: ["+", stats.added, " −", stats.removed]
 									})
 								]
 							}),
@@ -129,10 +330,15 @@ window.__ModuleLoader__.load({
 								className: "dsh-fc-hint",
 								children: ["共 ", entry.items.length, " 次变更 · ", last.op === "delete" ? "文件已删除" : ""]
 							}),
-							diff.contextBefore.map((l, i) => react_jsx_runtime.jsx("div", { className: "dsh-fc-line dsh-fc-ctx", key: "cb" + i, children: l || " " })),
-							diff.removed.map((l, i) => react_jsx_runtime.jsx("div", { className: "dsh-fc-line dsh-fc-del", key: "rm" + i, children: (l || " ").slice(0, 400) })),
-							diff.added.map((l, i) => react_jsx_runtime.jsx("div", { className: "dsh-fc-line dsh-fc-add", key: "ad" + i, children: (l || " ").slice(0, 400) })),
-							diff.contextAfter.map((l, i) => react_jsx_runtime.jsx("div", { className: "dsh-fc-line dsh-fc-ctx", key: "ca" + i, children: l || " " })),
+							react_jsx_runtime.jsx("div", { className: "dsh-fc-sub", children: "累计变更" }),
+							react_jsx_runtime.jsx(DiffLines, { rows, prefix: "c" }),
+							entry.items.length > 0 && react_jsx_runtime.jsxs("div", {
+								className: "dsh-fc-hist",
+								children: [
+									react_jsx_runtime.jsx("div", { className: "dsh-fc-sub", children: "变更历史（改动前 → 后）" }),
+									entry.items.map((c, i) => react_jsx_runtime.jsx(ChangeRecord, { key: c.seq + "-" + i, item: c, index: i }))
+								]
+							}),
 							fb && fb.status === "conflict" && react_jsx_runtime.jsx("div", {
 								className: "dsh-fc-warn",
 								children: "文件已被后续修改，无法自动还原（可手工处理）。"
@@ -598,6 +804,12 @@ window.__ModuleLoader__.load({
 			}, [sessionId]);
 			const value = typeof useProjection === "function" ? useProjection("fileChanges") : void 0;
 			const changes = value && Array.isArray(value.changes) ? value.changes : [];
+			// 「文件」标签页也把投影镜像到 window store（兜底：hero 阶段 dock 未挂载时）。
+			react.useEffect(() => {
+				if (!sessionId) return;
+				const store = ensureFileChangesStore();
+				if (store) store.set(sessionId, value || { changes: [], truncated: false });
+			}, [sessionId, value]);
 			const groups = react.useMemo(() => groupChanges(changes), [changes]);
 			const changedPaths = react.useMemo(() => {
 				const s = new Set();
@@ -719,7 +931,17 @@ window.__ModuleLoader__.load({
 			".dsh-fc-line{white-space:pre;min-height:17px}",
 			".dsh-fc-del{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 14%,transparent);color:var(--dsw-alias-label-primary)}",
 			".dsh-fc-add{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 14%,transparent);color:var(--dsw-alias-label-primary)}",
+			".dsh-fc-mod{background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 16%,transparent);color:var(--dsw-alias-label-primary)}",
 			".dsh-fc-ctx{color:var(--dsw-alias-label-tertiary)}",
+			".dsh-fc-sub{color:var(--dsw-alias-label-secondary);font-size:10.5px;font-weight:600;margin:6px 0 2px}",
+			".dsh-fc-hist{display:flex;flex-direction:column;gap:2px;margin-top:6px;border-top:1px solid var(--dsw-alias-border-l2);padding-top:6px}",
+			".dsh-fc-hist-item{border-radius:6px;overflow:hidden}",
+			".dsh-fc-hist-row{display:flex;align-items:center;gap:6px;padding:3px 4px;border-radius:6px;cursor:pointer}",
+			".dsh-fc-hist-row:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+			".dsh-fc-hist-toggle{appearance:none;border:none;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;width:16px;height:16px;border-radius:4px;padding:0;font-size:9px;flex:none}",
+			".dsh-fc-hist-seq{color:var(--dsw-alias-label-caption);font-size:10px;font-variant-numeric:tabular-nums;flex:none}",
+			".dsh-fc-hist-time{color:var(--dsw-alias-label-caption);font-size:10px;font-variant-numeric:tabular-nums;flex:none}",
+			".dsh-fc-hist-diff{margin:0 0 4px 22px;padding:4px 6px;background:var(--dsw-alias-bg-layer-2);border-left:2px solid var(--dsw-alias-border-l2);overflow-x:auto}",
 			".dsh-fc-warn{color:var(--dsw-alias-state-warn-label);font-size:11.5px;margin-top:6px;padding:4px 8px;background:var(--dsw-alias-bg-module-platform);border-radius:6px}",
 			".dsh-fc-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;height:100%;padding:24px}",
 			".dsh-fc-empty-title{color:var(--dsw-alias-label-primary);font-size:13px;font-weight:500}",
@@ -778,21 +1000,101 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 
+		// -----------------------------------------------------------------------
+		// 窗口全局 store：把会话级 changes 镜像到 window.__dshFileChanges，
+		// 供 better-sidebar 编辑器按 path 查询、叠加改动行高亮。两个插件同页
+		// 运行，走 window 全局最小侵入打通（不依赖宿主 service、不复制投影数据）。
+		// -----------------------------------------------------------------------
+		function ensureFileChangesStore() {
+			if (typeof window === "undefined") return null;
+			if (window.__dshFileChanges && typeof window.__dshFileChanges.queryFileHighlight === "function") {
+				return window.__dshFileChanges;
+			}
+			const sessions = new Map(); // sessionId -> { changes, truncated }
+			const listeners = new Set();
+			const store = {
+				set(sessionId, value) {
+					const changes = value && Array.isArray(value.changes) ? value.changes : [];
+					const truncated = !!(value && value.truncated);
+					sessions.set(sessionId, { changes, truncated });
+					// 只保留最近 50 个会话的镜像，避免长期运行累积已关闭会话的引用。
+					if (sessions.size > 50) {
+						const oldest = sessions.keys().next().value;
+						sessions.delete(oldest);
+					}
+					for (const fn of [...listeners]) { try { fn(); } catch {} }
+				},
+				get(sessionId) {
+					return sessions.get(sessionId) || { changes: [], truncated: false };
+				},
+				subscribe(fn) {
+					listeners.add(fn);
+					return () => { listeners.delete(fn); };
+				},
+				queryFileHighlight(sessionId, path) {
+					const { changes } = sessions.get(sessionId) || { changes: [] };
+					return queryFileHighlight(changes, path);
+				}
+			};
+			window.__dshFileChanges = store;
+			return store;
+		}
+
+		/** 隐藏 dock occupant：持续把 useProjection("fileChanges") 镜像到 window
+		 *  store，使 better-sidebar 编辑器无需打开「文件」标签页也能读到本会话
+		 *  改动（与 dsh-change-review 同一挂载手法）。返回 null，不渲染任何 UI。 */
+		function FileChangesCapture(props) {
+			const sessionId = props.sessionId;
+			const useProjection = props.useProjection;
+			let value;
+			try {
+				if (typeof useProjection === "function") value = useProjection("fileChanges");
+			} catch { value = void 0; }
+			react.useEffect(() => {
+				if (!sessionId) return;
+				const store = ensureFileChangesStore();
+				if (store) store.set(sessionId, value || { changes: [], truncated: false });
+			});
+			return null;
+		}
+
 		const inject = ["slots"];
 
 		function apply(ctx) {
 			ensureCss();
 			buildPreviewPanel();
+			ensureFileChangesStore();
 			ctx.slots.inject("conversation.view", () => ctx.slots.register({
 				name: "conversation.view",
 				id: "file-changes",
 				order: 20,
 				label: () => "文件"
 			}, FileChangesView), "dsh-client-file-changes: conversation view entry");
+			ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
+				name: "conversation.composer.dock",
+				id: "file-changes-capture",
+				order: 90
+			}, FileChangesCapture), "dsh-client-file-changes: fileChanges capture");
 		}
 
 		exports.apply = apply;
 		exports.inject = inject;
+		// 纯函数暴露给单测（不触发 DOM / React 副作用）。
+		exports.__internals = {
+			splitLines,
+			diffRows,
+			diffStats,
+			diffKindClass,
+			highlightNewLines,
+			queryFileHighlight,
+			groupChanges,
+			formatTime,
+			basename,
+			dirname,
+			normPath,
+			ensureFileChangesStore,
+			OP_LABEL
+		};
 		return module.exports;
 	}
 });

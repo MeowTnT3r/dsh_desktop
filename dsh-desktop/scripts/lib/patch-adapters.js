@@ -412,6 +412,35 @@ function transformWorkspaceSearchRailFix(src, file) {
 }
 
 // ---------------------------------------------------------------------------
+// K25 手动排序拖拽失效修复（dsh-client-ui-workspace 会话行拖拽）。
+//
+// 根因：会话行 HTML5 拖拽在 onDragStart 里 setDrag（React 18 批处理，非离散
+// 事件默认优先级，不保证同步 flush），随后浏览器连续派发 dragover/drop 时，
+// 行级 onDragOver/onDrop 闭包里的 `drag.active`（渲染期布尔）仍是上一次渲染的
+// false，导致 e.preventDefault() 未执行 → 浏览器判定目标不可 drop → 拖拽无效，
+// 顺序既未提交也未持久化。修法：在 onDragStart 内用 react-dom 的 flushSync 同步
+// 提交 drag 状态，确保首个 dragover 到达前 drag.active 已更新为 true。
+// 仅改会话行（node.id）拖拽起点，不动工作区行（row.key）、不动排序/持久化逻辑。
+// ---------------------------------------------------------------------------
+const MANUAL_SORT_DRAG_MARKER = 'dsh-desktop fix: manual sort drag sync';
+
+const MANUAL_SORT_DRAG_REQUIRE_ANCHOR = 'let _deepseek_ai_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");';
+const MANUAL_SORT_DRAG_REQUIRE_INSERT = MANUAL_SORT_DRAG_REQUIRE_ANCHOR + '\n\t\tlet react_dom = require("react-dom"); // ' + MANUAL_SORT_DRAG_MARKER;
+
+const MANUAL_SORT_DRAG_START_ANCHOR = 'e.dataTransfer.setData("text/plain", node.id);\n\t\t\t\t\t\tdrag.start();';
+const MANUAL_SORT_DRAG_START_FIX = 'e.dataTransfer.setData("text/plain", node.id);\n\t\t\t\t\t\treact_dom.flushSync(() => {\n\t\t\t\t\t\t\tdrag.start();\n\t\t\t\t\t\t});';
+
+function transformManualSortFix(src, file) {
+  if (src.includes(MANUAL_SORT_DRAG_MARKER)) return { status: 'already' };
+  if (!src.includes(MANUAL_SORT_DRAG_REQUIRE_ANCHOR) || !src.includes(MANUAL_SORT_DRAG_START_ANCHOR)) {
+    return { status: 'anchor-missing', detail: '锚点未匹配（dsh 版本可能已变化），跳过 ' + file };
+  }
+  let out = src.replace(MANUAL_SORT_DRAG_REQUIRE_ANCHOR, MANUAL_SORT_DRAG_REQUIRE_INSERT);
+  out = out.replace(MANUAL_SORT_DRAG_START_ANCHOR, MANUAL_SORT_DRAG_START_FIX);
+  return { status: 'changed', src: out };
+}
+
+// ---------------------------------------------------------------------------
 // 插件页标签合并补丁（原 applyPluginInventoryTabMergeFix）。
 // ---------------------------------------------------------------------------
 const PLUGIN_INVENTORY_TAB_MARKER = 'dsh-desktop fix: hide inventory tab';
@@ -1260,6 +1289,29 @@ const SESSION_EVENT_BOUND_LOADOLDER_NEW = [
   '\t\t\t\t\tthis.trimSuppressedFloor = this.events.length;',
 ].join('\n');
 
+// K22 滚动回底修复：trim 只在 turn 边界（running=false）裁窗。流式期间
+// （running=true）用户常已上滚读更早历史，此时 trim → replaceWindow 重建会触发
+// UI 的 follow/自动滚底（followSig 因 firstSeq/order.length 变化而 tipMoved）+ 内容
+// 收缩把 scrollTop 钳到新底，把用户从顶部拉回底部。改为：流式期间仅在超过
+// SESSION_EVENT_RUNNING_HARD_CAP 的紧急上限才裁（OOM 兜底），否则推迟到 turn
+// 边界由下一次 append（running=false）照常裁回 SESSION_EVENT_KEEP。
+const SESSION_EVENT_RUNNING_CAP_ANCHOR = '\t\tconst SESSION_EVENT_BOUND = 2000;';
+const SESSION_EVENT_RUNNING_CAP_INJECTION = [
+  '\t\tconst SESSION_EVENT_BOUND = 2000;',
+  '\t\t// ' + SESSION_EVENT_BOUND_MARKER + ' (K22): hard cap while a turn is actively streaming.',
+  '\t\tconst SESSION_EVENT_RUNNING_HARD_CAP = 6000;',
+].join('\n');
+
+const SESSION_EVENT_RUNNING_GUARD_ANCHOR = '\t\t\t\tif (this.events.length <= SESSION_EVENT_BOUND) return;';
+const SESSION_EVENT_RUNNING_GUARD_INJECTION = [
+  '\t\t\t\tif (this.events.length <= SESSION_EVENT_BOUND) return;',
+  '\t\t\t\t// ' + SESSION_EVENT_BOUND_MARKER + ' (K22): do not trim while a turn is streaming —',
+  '\t\t\t\t// the reader may have scrolled up to the window head, and replaceWindow would',
+  '\t\t\t\t// snap them back to the bottom. Defer to the turn boundary (running === false),',
+  '\t\t\t\t// keeping only the emergency hard cap so a pathological single turn cannot OOM.',
+  '\t\t\t\tif (this.running === true && this.events.length <= SESSION_EVENT_RUNNING_HARD_CAP) return;',
+].join('\n');
+
 function transformSessionEventBound(src, file) {
   if (src.includes(SESSION_EVENT_BOUND_MARKER)) return { status: 'already' };
   const anchors = [SESSION_EVENT_BOUND_CONSTANTS_OLD, SESSION_EVENT_BOUND_DISPOSE_OLD, SESSION_EVENT_BOUND_DROP_OLD, SESSION_EVENT_BOUND_APPENDLIVE_OLD, SESSION_EVENT_BOUND_LOADOLDER_OLD];
@@ -1273,6 +1325,393 @@ function transformSessionEventBound(src, file) {
   out = out.replace(SESSION_EVENT_BOUND_DROP_OLD, SESSION_EVENT_BOUND_DROP_NEW);
   out = out.replace(SESSION_EVENT_BOUND_APPENDLIVE_OLD, SESSION_EVENT_BOUND_APPENDLIVE_NEW);
   out = out.replace(SESSION_EVENT_BOUND_LOADOLDER_OLD, SESSION_EVENT_BOUND_LOADOLDER_NEW);
+  // K22：流式期间暂缓 trim（running 门控 + 紧急硬上限），避免 replaceWindow 重建把上滚读者拉回底部。
+  out = out.replace(SESSION_EVENT_RUNNING_CAP_ANCHOR, SESSION_EVENT_RUNNING_CAP_INJECTION);
+  out = out.replace(SESSION_EVENT_RUNNING_GUARD_ANCHOR, SESSION_EVENT_RUNNING_GUARD_INJECTION);
+  return { status: 'changed', src: out };
+}
+
+// ---------------------------------------------------------------------------
+// 一键加载全部历史（K24）：长会话不用反复点「加载更早」（每次 50 条，20 万事件
+// 会话要点几十次）。给内核 Session 加 loadAllHistory()：按 400 条/批循环
+// history({beforeSeq, maxMessages}) 拉取，每批 prepend 后 await 让出一帧并更新
+// 进度，10000 条保护上限防超大会话把渲染进程打爆；再次点击 / 新会话可经
+// cancelLoadAllHistory() 中断。复用 loadOlder 的去重 + baseSeq + hasMore + trim
+// 抑制语义（与 K8 bounded-retention 组合，不破坏 loadOlder/trim/流式）。
+// 目标：dsh-client-runtime/lib/client.js（FLASH_PKG_REL）。锚点独立于 K8。
+// ---------------------------------------------------------------------------
+const LOAD_ALL_HISTORY_MARKER = 'dsh-desktop compat: load-all-history';
+
+const LOAD_ALL_HISTORY_INSERT_ANCHOR = [
+  '\t\t\t\t} finally {',
+  '\t\t\t\t\tthis.loadingOlder = false;',
+  '\t\t\t\t\tthis.notifier.markDirty();',
+  '\t\t\t\t}',
+  '\t\t\t}',
+  '\t\t\t/** Reconnect rebuild (manager calls this on onConnected for instances that were opened):',
+].join('\n');
+
+const LOAD_ALL_HISTORY_METHODS = [
+  '\t\t\t/** One-click batch loader: pull the entire remaining history in bounded batches,',
+  '\t\t\t*  yielding a frame between batches, with a hard message cap and a cancel token.',
+  '\t\t\t*  Reuses loadOlder\'s page-application semantics (seq dedup + baseSeq + hasMore +',
+  '\t\t\t*  trim suppression) so it composes with the bounded-retention trim. */',
+  '\t\t\tasync loadAllHistory() {',
+  '\t\t\t\t// ' + LOAD_ALL_HISTORY_MARKER + ' — re-entry + concurrency guards.',
+  '\t\t\t\tif (this.openState !== "open" || !this.hasMore || this.loadingAllHistory === true || this.loadingOlder === true) return;',
+  '\t\t\t\tthis.loadingAllHistory = true;',
+  '\t\t\t\tthis.loadingOlder = true;',
+  '\t\t\t\tthis.loadAllLoaded = 0;',
+  '\t\t\t\tthis.loadAllLimitReached = false;',
+  '\t\t\t\tthis.loadAllCancelled = false;',
+  '\t\t\t\tconst token = this.loadAllToken = (this.loadAllToken ?? 0) + 1;',
+  '\t\t\t\tconst generation = this.openGeneration;',
+  '\t\t\t\tconst BATCH = 400;',
+  '\t\t\t\tconst LIMIT = 10000;',
+  '\t\t\t\tthis.notifier.markDirty();',
+  '\t\t\t\ttry {',
+  '\t\t\t\t\twhile (this.loadAllToken === token && !this.loadAllCancelled && this.openGeneration === generation && this.openState === "open" && this.hasMore && this.loadAllLoaded < LIMIT) {',
+  '\t\t\t\t\t\tconst { result } = await this.history({ beforeSeq: this.baseSeq, maxMessages: BATCH });',
+  '\t\t\t\t\t\tif (this.loadAllToken !== token || this.openGeneration !== generation) break;',
+  '\t\t\t\t\t\tif (!result.ok) break;',
+  '\t\t\t\t\t\tconst older = result.value.events;',
+  '\t\t\t\t\t\tif (older.length === 0) {',
+  '\t\t\t\t\t\t\tthis.hasMore = result.value.hasMore;',
+  '\t\t\t\t\t\t\tthis.conversation.prepend([], this.hasMore);',
+  '\t\t\t\t\t\t\tbreak;',
+  '\t\t\t\t\t\t}',
+  '\t\t\t\t\t\tconst tail = older[older.length - 1];',
+  '\t\t\t\t\t\tif (tail === void 0 || tail.event.seq + 1 !== this.baseSeq) {',
+  '\t\t\t\t\t\t\tconsole.error(`[web-runtime] loadAllHistory discontinuous: tail seq ${tail?.event.seq} vs baseSeq ${this.baseSeq}`);',
+  '\t\t\t\t\t\t\tthis.hasMore = false;',
+  '\t\t\t\t\t\t\tthis.conversation.prepend([], false);',
+  '\t\t\t\t\t\t\tbreak;',
+  '\t\t\t\t\t\t}',
+  '\t\t\t\t\t\t// ' + LOAD_ALL_HISTORY_MARKER + ' — dedup the paged batch against the window',
+  '\t\t\t\t\t\t// (same seam guard as loadOlder) so a trim boundary never double-counts an event.',
+  '\t\t\t\t\t\tconst retainedSeqs = new Set(this.events.map((event) => event.seq));',
+  '\t\t\t\t\t\tconst freshOlder = older.filter((entry) => !retainedSeqs.has(entry.event.seq));',
+  '\t\t\t\t\t\tthis.events = [...freshOlder.map((e) => e.event), ...this.events];',
+  '\t\t\t\t\t\tthis.views = [...freshOlder.map((e) => e.view), ...this.views];',
+  '\t\t\t\t\t\tthis.baseSeq = freshOlder[0]?.event.seq ?? this.baseSeq;',
+  '\t\t\t\t\t\tthis.hasMore = result.value.hasMore;',
+  '\t\t\t\t\t\tthis.conversation.prepend(freshOlder.map(conversationInput), this.hasMore);',
+  '\t\t\t\t\t\tthis.trimSuppressed = true;',
+  '\t\t\t\t\t\tthis.trimSuppressedFloor = this.events.length;',
+  '\t\t\t\t\t\tthis.loadAllLoaded += freshOlder.length;',
+  '\t\t\t\t\t\tthis.notifier.markDirty();',
+  '\t\t\t\t\t\t// yield a frame so the prepend and the progress counter actually paint.',
+  '\t\t\t\t\t\tawait new Promise((resolve) => {',
+  '\t\t\t\t\t\t\tif (typeof requestAnimationFrame === "function") requestAnimationFrame(resolve);',
+  '\t\t\t\t\t\t\telse setTimeout(resolve, 0);',
+  '\t\t\t\t\t\t});',
+  '\t\t\t\t\t}',
+  '\t\t\t\t\tif (this.loadAllToken === token && this.hasMore && this.loadAllLoaded >= LIMIT) {',
+  '\t\t\t\t\t\tthis.loadAllLimitReached = true;',
+  '\t\t\t\t\t\tthis.notifier.markDirty();',
+  '\t\t\t\t\t}',
+  '\t\t\t\t} catch (error) {',
+  '\t\t\t\t\tconsole.error("[web-runtime] loadAllHistory failed:", error);',
+  '\t\t\t\t} finally {',
+  '\t\t\t\t\tthis.loadingAllHistory = false;',
+  '\t\t\t\t\tthis.loadingOlder = false;',
+  '\t\t\t\t\tthis.notifier.markDirty();',
+  '\t\t\t\t}',
+  '\t\t\t}',
+  '\t\t\t/** Cancel an in-flight load-all-history run (re-click or session switch). */',
+  '\t\t\tcancelLoadAllHistory() {',
+  '\t\t\t\tthis.loadAllCancelled = true;',
+  '\t\t\t\tthis.loadAllToken = (this.loadAllToken ?? 0) + 1;',
+  '\t\t\t}',
+];
+
+const LOAD_ALL_HISTORY_INSERT_REPLACEMENT = [
+  '\t\t\t\t} finally {',
+  '\t\t\t\t\tthis.loadingOlder = false;',
+  '\t\t\t\t\tthis.notifier.markDirty();',
+  '\t\t\t\t}',
+  '\t\t\t}',
+  ...LOAD_ALL_HISTORY_METHODS,
+  '\t\t\t/** Reconnect rebuild (manager calls this on onConnected for instances that were opened):',
+].join('\n');
+
+const LOAD_ALL_HISTORY_SNAPSHOT_ANCHOR = '\t\t\t\t\tloadingOlder: this.loadingOlder,';
+const LOAD_ALL_HISTORY_SNAPSHOT_REPLACEMENT = [
+  '\t\t\t\t\tloadingOlder: this.loadingOlder,',
+  '\t\t\t\t\tloadingAllHistory: this.loadingAllHistory,',
+  '\t\t\t\t\tloadAllLoaded: this.loadAllLoaded,',
+  '\t\t\t\t\tloadAllLimitReached: this.loadAllLimitReached,',
+].join('\n');
+
+function transformLoadAllHistory(src, file) {
+  if (src.includes(LOAD_ALL_HISTORY_MARKER)) return { status: 'already' };
+  const missing = [];
+  if (!src.includes(LOAD_ALL_HISTORY_INSERT_ANCHOR)) missing.push('loadOlder finally/Reconnect anchor');
+  if (!src.includes(LOAD_ALL_HISTORY_SNAPSHOT_ANCHOR)) missing.push('buildSnapshot loadingOlder anchor');
+  if (missing.length > 0) {
+    return { status: 'anchor-missing', detail: '未找到 load-all-history 锚点（版本可能已变更）：' + missing.join(' / ') + '，跳过 ' + file };
+  }
+  let out = src;
+  out = out.replace(LOAD_ALL_HISTORY_INSERT_ANCHOR, LOAD_ALL_HISTORY_INSERT_REPLACEMENT);
+  out = out.replace(LOAD_ALL_HISTORY_SNAPSHOT_ANCHOR, LOAD_ALL_HISTORY_SNAPSHOT_REPLACEMENT);
+  return { status: 'changed', src: out };
+}
+
+// ---------------------------------------------------------------------------
+// 一键加载全部历史 —— UI 侧（K24）：在「加载更早」旁加「加载全部历史」按钮 +
+// 进度/停止/达上限提示。只追加新块、不动 K22 排查中的自动滚底 / loadOlder 锚点
+// 逻辑。目标：dsh-client-ui-conversation/lib/client.js（CONVERSATION_PKG_REL）。
+// ---------------------------------------------------------------------------
+const LOAD_ALL_HISTORY_UI_MARKER = 'dsh-desktop compat: load-all-history button';
+
+const LOAD_ALL_HISTORY_UI_CTRL_ANCHOR = [
+  '\t\t\t/** Pull one older history page for the scoped Session. */',
+  '\t\t\tasync loadOlder() {',
+  '\t\t\t\tawait this.scopedSession("loadOlder").loadOlder();',
+  '\t\t\t}',
+].join('\n');
+const LOAD_ALL_HISTORY_UI_CTRL_REPLACEMENT = [
+  '\t\t\t/** Pull one older history page for the scoped Session. */',
+  '\t\t\tasync loadOlder() {',
+  '\t\t\t\tawait this.scopedSession("loadOlder").loadOlder();',
+  '\t\t\t}',
+  '\t\t\t/** ' + LOAD_ALL_HISTORY_UI_MARKER + ' — one-click batch load of the entire remaining history. */',
+  '\t\t\tasync loadAllHistory() {',
+  '\t\t\t\tawait this.scopedSession("loadAllHistory").loadAllHistory();',
+  '\t\t\t}',
+  '\t\t\t/** ' + LOAD_ALL_HISTORY_UI_MARKER + ' — cancel an in-flight batch load. */',
+  '\t\t\tasync cancelLoadAllHistory() {',
+  '\t\t\t\tawait this.scopedSession("loadAllHistory").cancelLoadAllHistory();',
+  '\t\t\t}',
+].join('\n');
+
+const LOAD_ALL_HISTORY_UI_SIGNATURE_OLD = '\t\tfunction ChatView({ useSession, useSessions, useStore, renderSlot, sessionId, openFile, loadOlder, loadImage, inspectCall, chatScroll, forkAt, fileMentions, t }) {';
+const LOAD_ALL_HISTORY_UI_SIGNATURE_NEW = '\t\tfunction ChatView({ useSession, useSessions, useStore, renderSlot, sessionId, openFile, loadOlder, loadAllHistory, cancelLoadAllHistory, loadImage, inspectCall, chatScroll, forkAt, fileMentions, t }) {';
+
+const LOAD_ALL_HISTORY_UI_STATE_ANCHOR = '\t\t\tconst loadingOlder = useSession((s) => s.loadingOlder);';
+const LOAD_ALL_HISTORY_UI_STATE_REPLACEMENT = [
+  '\t\t\tconst loadingOlder = useSession((s) => s.loadingOlder);',
+  '\t\t\t// ' + LOAD_ALL_HISTORY_UI_MARKER + ' — load-all progress / limit state.',
+  '\t\t\tconst loadingAllHistory = useSession((s) => s.loadingAllHistory);',
+  '\t\t\tconst loadAllLoaded = useSession((s) => s.loadAllLoaded);',
+  '\t\t\tconst loadAllLimitReached = useSession((s) => s.loadAllLimitReached);',
+].join('\n');
+
+const LOAD_ALL_HISTORY_UI_ANCHORED_ANCHOR = [
+  '\t\t\tconst loadOlderAnchored = () => {',
+  '\t\t\t\tconst local = listRef.current;',
+  '\t\t\t\t/* v8 ignore next -- ref-null guard: the paging button renders inside the list tree. */',
+  '\t\t\t\tif (local !== null) {',
+  '\t\t\t\t\tconst el = scrollerOf(local);',
+  '\t\t\t\t\tconst row = pagingAnchor(local, el);',
+  '\t\t\t\t\tif (row !== null && row.dataset.chatAnchorKey !== void 0) anchorRef.current = {',
+  '\t\t\t\t\t\tkey: row.dataset.chatAnchorKey,',
+  '\t\t\t\t\t\ttop: flowTop(row, el)',
+  '\t\t\t\t\t};',
+  '\t\t\t\t}',
+  '\t\t\t\tloadOlder();',
+  '\t\t\t};',
+].join('\n');
+const LOAD_ALL_HISTORY_UI_ANCHORED_REPLACEMENT = [
+  '\t\t\tconst loadOlderAnchored = () => {',
+  '\t\t\t\tconst local = listRef.current;',
+  '\t\t\t\t/* v8 ignore next -- ref-null guard: the paging button renders inside the list tree. */',
+  '\t\t\t\tif (local !== null) {',
+  '\t\t\t\t\tconst el = scrollerOf(local);',
+  '\t\t\t\t\tconst row = pagingAnchor(local, el);',
+  '\t\t\t\t\tif (row !== null && row.dataset.chatAnchorKey !== void 0) anchorRef.current = {',
+  '\t\t\t\t\t\tkey: row.dataset.chatAnchorKey,',
+  '\t\t\t\t\t\ttop: flowTop(row, el)',
+  '\t\t\t\t\t};',
+  '\t\t\t\t}',
+  '\t\t\t\tloadOlder();',
+  '\t\t\t};',
+  '\t\t\t// ' + LOAD_ALL_HISTORY_UI_MARKER + ' — same first-batch anchor as loadOlder (keeps reading',
+  '\t\t\t// position stable while the batch stream prepends older content).',
+  '\t\t\tconst loadAllHistoryAnchored = () => {',
+  '\t\t\t\tconst local = listRef.current;',
+  '\t\t\t\t/* v8 ignore next -- ref-null guard: the paging button renders inside the list tree. */',
+  '\t\t\t\tif (local !== null) {',
+  '\t\t\t\t\tconst el = scrollerOf(local);',
+  '\t\t\t\t\tconst row = pagingAnchor(local, el);',
+  '\t\t\t\t\tif (row !== null && row.dataset.chatAnchorKey !== void 0) anchorRef.current = {',
+  '\t\t\t\t\t\tkey: row.dataset.chatAnchorKey,',
+  '\t\t\t\t\t\ttop: flowTop(row, el)',
+  '\t\t\t\t\t};',
+  '\t\t\t\t}',
+  '\t\t\t\tloadAllHistory();',
+  '\t\t\t};',
+].join('\n');
+
+const LOAD_ALL_HISTORY_UI_BUTTON_ANCHOR = [
+  '\t\t\t\t\t\t\thasMore && (0, react_jsx_runtime.jsx)("div", {',
+  '\t\t\t\t\t\t\t\tclassName: ChatView_module_css_default.older,',
+  '\t\t\t\t\t\t\t\tchildren: (0, react_jsx_runtime.jsx)("button", {',
+  '\t\t\t\t\t\t\t\t\ttype: "button",',
+  '\t\t\t\t\t\t\t\t\tdisabled: loadingOlder,',
+  '\t\t\t\t\t\t\t\t\tonClick: loadOlderAnchored,',
+  '\t\t\t\t\t\t\t\t\tchildren: loadingOlder ? t("loading") : t("chat.loadOlder")',
+  '\t\t\t\t\t\t\t\t})',
+  '\t\t\t\t\t\t\t}),',
+].join('\n');
+const LOAD_ALL_HISTORY_UI_BUTTON_REPLACEMENT = [
+  '\t\t\t\t\t\t\thasMore && (0, react_jsx_runtime.jsx)("div", {',
+  '\t\t\t\t\t\t\t\tclassName: ChatView_module_css_default.older,',
+  '\t\t\t\t\t\t\t\tchildren: (0, react_jsx_runtime.jsx)("button", {',
+  '\t\t\t\t\t\t\t\t\ttype: "button",',
+  '\t\t\t\t\t\t\t\t\tdisabled: loadingOlder,',
+  '\t\t\t\t\t\t\t\t\tonClick: loadOlderAnchored,',
+  '\t\t\t\t\t\t\t\t\tchildren: loadingOlder ? t("loading") : t("chat.loadOlder")',
+  '\t\t\t\t\t\t\t\t})',
+  '\t\t\t\t\t\t\t}),',
+  '\t\t\t\t\t\t\t// ' + LOAD_ALL_HISTORY_UI_MARKER + ' — progress line while a batch load is running.',
+  '\t\t\t\t\t\t\tloadingAllHistory && (0, react_jsx_runtime.jsx)("div", {',
+  '\t\t\t\t\t\t\t\tclassName: ChatView_module_css_default.older,',
+  '\t\t\t\t\t\t\t\tchildren: t("chat.loadAllProgress", {',
+  '\t\t\t\t\t\t\t\t\tloaded: loadAllLoaded ?? 0',
+  '\t\t\t\t\t\t\t\t})',
+  '\t\t\t\t\t\t\t}),',
+  '\t\t\t\t\t\t\t// ' + LOAD_ALL_HISTORY_UI_MARKER + ' — start/cancel toggle (hidden once limit hit).',
+  '\t\t\t\t\t\t\thasMore && !loadAllLimitReached && (0, react_jsx_runtime.jsx)("div", {',
+  '\t\t\t\t\t\t\t\tclassName: ChatView_module_css_default.older,',
+  '\t\t\t\t\t\t\t\tchildren: (0, react_jsx_runtime.jsx)("button", {',
+  '\t\t\t\t\t\t\t\t\ttype: "button",',
+  '\t\t\t\t\t\t\t\t\tonClick: loadingAllHistory ? cancelLoadAllHistory : loadAllHistoryAnchored,',
+  '\t\t\t\t\t\t\t\t\tchildren: loadingAllHistory ? t("chat.loadAllCancel") : t("chat.loadAllHistory")',
+  '\t\t\t\t\t\t\t\t})',
+  '\t\t\t\t\t\t\t}),',
+  '\t\t\t\t\t\t\t// ' + LOAD_ALL_HISTORY_UI_MARKER + ' — reached the protection cap; more is still available via loadOlder.',
+  '\t\t\t\t\t\t\thasMore && !loadingAllHistory && loadAllLimitReached && (0, react_jsx_runtime.jsx)("div", {',
+  '\t\t\t\t\t\t\t\tclassName: ChatView_module_css_default.older,',
+  '\t\t\t\t\t\t\t\tchildren: t("chat.loadAllLimit", {',
+  '\t\t\t\t\t\t\t\t\tloaded: loadAllLoaded ?? 0',
+  '\t\t\t\t\t\t\t\t})',
+  '\t\t\t\t\t\t\t}),',
+].join('\n');
+
+const LOAD_ALL_HISTORY_UI_INJECT_ANCHOR = [
+  '\t\t\t\t\t\tloadOlder: () => {',
+  '\t\t\t\t\t\t\tscoped.loadOlder();',
+  '\t\t\t\t\t\t},',
+].join('\n');
+const LOAD_ALL_HISTORY_UI_INJECT_REPLACEMENT = [
+  '\t\t\t\t\t\tloadOlder: () => {',
+  '\t\t\t\t\t\t\tscoped.loadOlder();',
+  '\t\t\t\t\t\t},',
+  '\t\t\t\t\t\tloadAllHistory: () => {',
+  '\t\t\t\t\t\t\tscoped.loadAllHistory();',
+  '\t\t\t\t\t\t},',
+  '\t\t\t\t\t\tcancelLoadAllHistory: () => {',
+  '\t\t\t\t\t\t\tscoped.cancelLoadAllHistory();',
+  '\t\t\t\t\t\t},',
+].join('\n');
+
+const LOAD_ALL_HISTORY_UI_ZH_ANCHOR = '\t\t\t"chat.loadOlder": "加载更早",';
+const LOAD_ALL_HISTORY_UI_ZH_REPLACEMENT = [
+  '\t\t\t"chat.loadOlder": "加载更早",',
+  '\t\t\t"chat.loadAllHistory": "加载全部历史",',
+  '\t\t\t"chat.loadAllProgress": "已加载 {loaded} 条历史…",',
+  '\t\t\t"chat.loadAllCancel": "停止加载",',
+  '\t\t\t"chat.loadAllLimit": "已加载 {loaded} 条历史（已达上限，可继续「加载更早」）",',
+].join('\n');
+
+const LOAD_ALL_HISTORY_UI_EN_ANCHOR = '\t\t\t"chat.loadOlder": "Load earlier",';
+const LOAD_ALL_HISTORY_UI_EN_REPLACEMENT = [
+  '\t\t\t"chat.loadOlder": "Load earlier",',
+  '\t\t\t"chat.loadAllHistory": "Load all history",',
+  '\t\t\t"chat.loadAllProgress": "Loaded {loaded} messages…",',
+  '\t\t\t"chat.loadAllCancel": "Stop loading",',
+  '\t\t\t"chat.loadAllLimit": "Loaded {loaded} messages (limit reached — use \u201cLoad earlier\u201d for more)",',
+].join('\n');
+
+function transformLoadAllHistoryUi(src, file) {
+  if (src.includes(LOAD_ALL_HISTORY_UI_MARKER)) return { status: 'already' };
+  const anchors = [
+    LOAD_ALL_HISTORY_UI_CTRL_ANCHOR,
+    LOAD_ALL_HISTORY_UI_SIGNATURE_OLD,
+    LOAD_ALL_HISTORY_UI_STATE_ANCHOR,
+    LOAD_ALL_HISTORY_UI_ANCHORED_ANCHOR,
+    LOAD_ALL_HISTORY_UI_BUTTON_ANCHOR,
+    LOAD_ALL_HISTORY_UI_INJECT_ANCHOR,
+    LOAD_ALL_HISTORY_UI_ZH_ANCHOR,
+    LOAD_ALL_HISTORY_UI_EN_ANCHOR,
+  ];
+  const missing = [];
+  if (!src.includes(anchors[0])) missing.push('controller loadOlder');
+  if (!src.includes(anchors[1])) missing.push('ChatView signature');
+  if (!src.includes(anchors[2])) missing.push('loadingOlder state');
+  if (!src.includes(anchors[3])) missing.push('loadOlderAnchored');
+  if (!src.includes(anchors[4])) missing.push('loadOlder button');
+  if (!src.includes(anchors[5])) missing.push('inject loadOlder');
+  if (!src.includes(anchors[6])) missing.push('zh loadOlder');
+  if (!src.includes(anchors[7])) missing.push('en loadOlder');
+  if (missing.length > 0) {
+    return { status: 'anchor-missing', detail: '未找到 load-all-history UI 锚点（版本可能已变更）：' + missing.join(' / ') + '，跳过 ' + file };
+  }
+  let out = src;
+  out = out.replace(anchors[0], LOAD_ALL_HISTORY_UI_CTRL_REPLACEMENT);
+  out = out.replace(anchors[1], LOAD_ALL_HISTORY_UI_SIGNATURE_NEW);
+  out = out.replace(anchors[2], LOAD_ALL_HISTORY_UI_STATE_REPLACEMENT);
+  out = out.replace(anchors[3], LOAD_ALL_HISTORY_UI_ANCHORED_REPLACEMENT);
+  out = out.replace(anchors[4], LOAD_ALL_HISTORY_UI_BUTTON_REPLACEMENT);
+  out = out.replace(anchors[5], LOAD_ALL_HISTORY_UI_INJECT_REPLACEMENT);
+  out = out.replace(anchors[6], LOAD_ALL_HISTORY_UI_ZH_REPLACEMENT);
+  out = out.replace(anchors[7], LOAD_ALL_HISTORY_UI_EN_REPLACEMENT);
+  return { status: 'changed', src: out };
+}
+
+// ---------------------------------------------------------------------------
+// skill 工具行汉化（K27）：dsh-client-ui-skill 的 SkillRow 里「Skill」标题与
+// 「Inspect」按钮是硬编码英文，绕过 locale 词典（zh/en 已齐备）。补丁把两处
+// 改为 t("row.title") / t("row.inspect")，并在 zh/en 词典补齐对应键。工具名
+// "skill"（keyed slot key 与注册名）、模型侧提示词（tool description / catalog
+// system-reminder）与 skill 名均不动。目标：dsh-client-ui-skill/lib/client.js。
+// ---------------------------------------------------------------------------
+const SKILL_UI_ZH_MARKER = 'dsh-desktop i18n: skill row title/inspect';
+
+const SKILL_UI_TITLE_OLD = '\t\t\t\t\t\t\tchildren: "Skill"';
+const SKILL_UI_TITLE_NEW = '\t\t\t\t\t\t\tchildren: t("row.title")';
+
+const SKILL_UI_INSPECT_OLD = '\t\t\t\t\t\tchildren: [(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconInspectOutline12, {}), "Inspect"]';
+const SKILL_UI_INSPECT_NEW = '\t\t\t\t\t\tchildren: [(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconInspectOutline12, {}), t("row.inspect")]';
+
+const SKILL_UI_NS_OLD = '\t\tconst NS = "skill";';
+const SKILL_UI_NS_NEW = '\t\tconst NS = "skill"; // ' + SKILL_UI_ZH_MARKER;
+
+const SKILL_UI_ZH_ANCHOR = '\t\t\t"menu.userOnly": "仅用户"\n\t\t};';
+const SKILL_UI_ZH_REPLACEMENT = [
+  '\t\t\t"menu.userOnly": "仅用户",',
+  '\t\t\t"row.title": "技能",',
+  '\t\t\t"row.inspect": "查看"',
+  '\t\t};',
+].join('\n');
+
+const SKILL_UI_EN_ANCHOR = '\t\t\t"menu.userOnly": "user-only"\n\t\t};';
+const SKILL_UI_EN_REPLACEMENT = [
+  '\t\t\t"menu.userOnly": "user-only",',
+  '\t\t\t"row.title": "Skill",',
+  '\t\t\t"row.inspect": "Inspect"',
+  '\t\t};',
+].join('\n');
+
+/** skill 工具行汉化变换（幂等，锚点失配跳过；工具名与模型侧提示词不动）。 */
+function transformSkillUiZh(src, file) {
+  if (src.includes(SKILL_UI_ZH_MARKER)) return { status: 'already' };
+  const missing = [];
+  if (!src.includes(SKILL_UI_TITLE_OLD)) missing.push('SkillRow 标题 "Skill"');
+  if (!src.includes(SKILL_UI_INSPECT_OLD)) missing.push('Inspect 按钮');
+  if (!src.includes(SKILL_UI_ZH_ANCHOR)) missing.push('zh 词典 menu.userOnly 尾行');
+  if (!src.includes(SKILL_UI_EN_ANCHOR)) missing.push('en 词典 menu.userOnly 尾行');
+  if (!src.includes(SKILL_UI_NS_OLD)) missing.push('const NS = "skill"');
+  if (missing.length > 0) {
+    return { status: 'anchor-missing', detail: '未找到 skill 行汉化锚点（版本可能已变更）：' + missing.join(' / ') + '，跳过 ' + file };
+  }
+  let out = src;
+  out = out.replace(SKILL_UI_TITLE_OLD, SKILL_UI_TITLE_NEW);
+  out = out.replace(SKILL_UI_INSPECT_OLD, SKILL_UI_INSPECT_NEW);
+  out = out.replace(SKILL_UI_ZH_ANCHOR, SKILL_UI_ZH_REPLACEMENT);
+  out = out.replace(SKILL_UI_EN_ANCHOR, SKILL_UI_EN_REPLACEMENT);
+  out = out.replace(SKILL_UI_NS_OLD, SKILL_UI_NS_NEW);
   return { status: 'changed', src: out };
 }
 
@@ -1482,6 +1921,7 @@ module.exports = {
   transformProfileBundleProfileBoot,
   transformSettingsSectionGuard,
   transformWorkspaceSearchRailFix,
+  transformManualSortFix,
   transformPluginInventoryTabMergeFix,
   // 持久 shell 停止修复（abort race + 中断升级）。
   transformPersistentShellAbortRace,
@@ -1507,6 +1947,9 @@ module.exports = {
   transformSessionEventBound,
   transformSessionHeaderScanGuard,
   transformSessionLoadGraceful,
+  transformLoadAllHistory,
+  transformLoadAllHistoryUi,
+  transformSkillUiZh,
   // K1 注入体常量（单测 vm 行为验证用，与 transform 同源；非 marker）。
   CREDENTIALS_HELPERS_CODE,
   // 包级补丁 node_modules 根应用器（唯一实现）。
@@ -1560,6 +2003,10 @@ module.exports = {
     SESSION_EVENT_BOUND_MARKER,
     SESSION_HEADER_SCAN_MARKER,
     SESSION_LOAD_GRACEFUL_MARKER,
+    LOAD_ALL_HISTORY_MARKER,
+    LOAD_ALL_HISTORY_UI_MARKER,
+    SKILL_UI_ZH_MARKER,
+    MANUAL_SORT_DRAG_MARKER,
     ...require('./loader-isolation').markers,
   },
 };

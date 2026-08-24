@@ -34473,6 +34473,62 @@ globalThis.__dshChunks__["editor"] = (require) => {
 	* swapped for diagrams. Module-level `pick` keeps the load effect stable.
 	*/
 	const LazyMermaidMarkdown = lazyChunkComponent("mermaid", (mod) => mod.MermaidMarkdown);
+	//#region src/client/file-changes-highlight.ts (inlined mirror — K28)
+	const HIGHLIGHT_CSS_TAG = "@deepseek-ai/dsh-better-sidebar/editor-diff-highlight.css";
+	function readFileChangesStore() {
+		if (typeof window === "undefined") return null;
+		const store = window.__dshFileChanges;
+		return store !== null && typeof store === "object" && typeof store.queryFileHighlight === "function" ? store : null;
+	}
+	function readFileHighlight(sessionId, path) {
+		const store = readFileChangesStore();
+		if (store === null) return null;
+		try {
+			const result = store.queryFileHighlight(sessionId, path);
+			return result !== null && typeof result === "object" && result.present === true ? result : null;
+		} catch {
+			return null;
+		}
+	}
+	function highlightKindClass(kind) {
+		return kind === "add" ? "dsh-editor-diff-add" : "dsh-editor-diff-mod";
+	}
+	function ensureDiffHighlightCss() {
+		if (typeof document === "undefined") return;
+		if (document.querySelector(`style[data-plugin-css=${JSON.stringify(HIGHLIGHT_CSS_TAG)}]`)) return;
+		const tag = document.createElement("style");
+		tag.dataset.plugin = "dsh-better-sidebar";
+		tag.dataset.pluginCss = HIGHLIGHT_CSS_TAG;
+		tag.textContent = [
+			".dsh-editor-diff-add{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent);box-shadow:inset 3px 0 0 var(--dsw-alias-state-success-primary)}",
+			".dsh-editor-diff-mod{background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 14%,transparent);box-shadow:inset 3px 0 0 var(--dsw-alias-state-warn-primary)}"
+		].join("");
+		document.head.appendChild(tag);
+	}
+	const DiffHighlightEffect = StateEffect.define();
+	const diffHighlightField = StateField.define({
+		create: () => Decoration.none,
+		update: (value, tr) => {
+			let next = value;
+			for (const effect of tr.effects) {
+				if (effect.is(DiffHighlightEffect)) next = effect.value;
+			}
+			return next;
+		},
+		provide: (field) => EditorView.decorations.from(field)
+	});
+	function buildDiffDecorations(doc, kinds) {
+		const ranges = [];
+		const limit = Math.min(kinds.length, doc.lines);
+		for (let i = 0; i < limit; i++) {
+			const kind = kinds[i];
+			if (kind !== "add" && kind !== "mod") continue;
+			const line = doc.line(i + 1);
+			ranges.push(Decoration.line({ class: highlightKindClass(kind) }).range(line.from));
+		}
+		return RangeSet.of(ranges, true);
+	}
+	//#endregion
 	function TextEditor(props) {
 		const { ctx, scope, path, viewerId, content, truncated } = props;
 		const [mode, setMode] = (0, react.useState)("preview");
@@ -34493,6 +34549,9 @@ globalThis.__dshChunks__["editor"] = (require) => {
 		const popupRef = (0, react.useRef)(null);
 		/** The markdown preview container (selection-containment + line lookup). */
 		const mdRef = (0, react.useRef)(null);
+		/** Inline agent-diff highlight: enabled flag + whether this file has changes. */
+		const [diffHighlight, setDiffHighlight] = (0, react.useState)(true);
+		const [hasDiff, setHasDiff] = (0, react.useState)(false);
 		const hidePopup = () => {
 			popupRef.current = null;
 			setPopup(null);
@@ -34541,6 +34600,7 @@ globalThis.__dshChunks__["editor"] = (require) => {
 						EditorState.tabSize.of(2),
 						EditorView.contentAttributes.of({ spellcheck: "false" }),
 						cmSurfaceTheme,
+						diffHighlightField,
 						themeComp.of(dark),
 						...language !== null ? [language] : [],
 						EditorView.updateListener.of((update) => {
@@ -34603,6 +34663,23 @@ globalThis.__dshChunks__["editor"] = (require) => {
 				themeCompRef.current = null;
 			};
 		}, [content, path]);
+		// Inline agent-diff highlight (K28): read the shared window store and
+		// tint add/mod lines; without dsh-client-file-changes this is a no-op.
+		(0, react.useEffect)(() => {
+			ensureDiffHighlightCss();
+			const store = readFileChangesStore();
+			const applyHighlight = () => {
+				const view = viewRef.current;
+				const hl = diffHighlight ? readFileHighlight(scope.sessionId, path) : null;
+				const kinds = hl !== null && hl.kinds !== void 0 && hl.kinds.length > 0 ? hl.kinds : [];
+				setHasDiff(hl !== null);
+				if (view === null) return;
+				const deco = kinds.length > 0 ? buildDiffDecorations(view.state.doc, kinds) : Decoration.none;
+				view.dispatch({ effects: DiffHighlightEffect.of(deco) });
+			};
+			applyHighlight();
+			return store === null ? void 0 : store.subscribe(applyHighlight);
+		}, [content, path, scope.sessionId, diffHighlight]);
 		(0, react.useEffect)(() => {
 			const view = viewRef.current;
 			const themeComp = themeCompRef.current;
@@ -34734,9 +34811,25 @@ globalThis.__dshChunks__["editor"] = (require) => {
 						"aria-label": t("save"),
 						title: `${t("save")} (Ctrl/Cmd+S)`,
 						onClick: save,
-						children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconCheckOutline16, {})
-					}),
-					saveLabel !== "" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconCheckOutline16, {})
+				}),
+				hasDiff && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+					type: "button",
+					className: sidebar_module_css_default.iconButton,
+					"aria-label": "diff highlight",
+					title: diffHighlight ? "关闭 diff 高亮" : "开启 diff 高亮",
+					"aria-pressed": diffHighlight,
+					onClick: () => {
+						setDiffHighlight((value) => !value);
+					},
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						style: {
+							opacity: diffHighlight ? 1 : 0.4
+						},
+						children: "±"
+					})
+				}),
+				saveLabel !== "" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 						className: clsx(sidebar_module_css_default.editorStatus, saveState === "failed" && sidebar_module_css_default.editorStatusError),
 						children: saveLabel
 					})
