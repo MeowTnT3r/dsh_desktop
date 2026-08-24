@@ -229,6 +229,7 @@ async function setupApplied(hostFiles, hostDown) {
   return {
     mod, kernel, inputActions, addImagesCalls, input, slotRegistrations,
     textarea: dom.textarea, listeners: dom.listeners, fetchCalls: dom.fetchCalls,
+    store: load.sandbox.window.__dshFileDropStore,
     renderSlot(withInput) {
       const entry = slotRegistrations[0].register();
       return entry.component({ inputActions, input: withInput || input });
@@ -366,8 +367,11 @@ test('e2e: 张数限额 —— 附件栏已有 19 张再拖 2 张：第 1 张进
   await flush(25);
   assert.deepEqual(e.kernel.calls.create, ['one.png'], '仅第 1 张进管道（20 张上限）');
   assert.equal(e.addImagesCalls[0].length, 1);
-  assert.match(e.textarea.value, /\[拖入 1 个文件\]/, '被拒的第 2 张回退路径提示');
-  assert.ok(e.textarea.value.includes('C:\\q\\two.png'));
+  // 被拒的第 2 张回退为附件 chip（路径提示），不再注入输入框。
+  assert.equal(e.textarea.value, '', '不再注入路径提示进输入框');
+  assert.deepEqual(Array.from(e.store.snapshotPending(e.inputActions), (x) => x.name), ['two.png'], '被拒的第 2 张应成为待发附件 chip');
+  assert.equal(e.store.snapshotPending(e.inputActions)[0].kind, 'path');
+  assert.equal(e.store.snapshotPending(e.inputActions)[0].path, 'C:\\q\\two.png');
 });
 
 test('e2e: 非图片（md + zip）不误路由 —— 不调宿主读图路由、不进管道、合并路径提示', async () => {
@@ -380,9 +384,10 @@ test('e2e: 非图片（md + zip）不误路由 —— 不调宿主读图路由�
   await flush(25);
   assert.equal(e.fetchCalls.length, 0, '非图片不得触发读图路由');
   assert.equal(e.kernel.calls.create.length, 0, '非图片不得进附件管道');
-  assert.match(e.textarea.value, /\[拖入 2 个文件\]/);
-  assert.ok(e.textarea.value.includes('C:\\t\\note.md'));
-  assert.ok(e.textarea.value.includes('C:\\t\\pack.zip'));
+  // 非图片成为附件 chip（路径提示），不再合并注入输入框。
+  assert.equal(e.textarea.value, '');
+  assert.deepEqual(Array.from(e.store.snapshotPending(e.inputActions), (x) => x.name), ['note.md', 'pack.zip']);
+  assert.ok(e.store.snapshotPending(e.inputActions).every((x) => x.kind === 'path'));
 });
 
 test('e2e: 超大图（>3.5MB）与非白名单图（bmp）→ 不读内容，维持路径提示（既有语义零回归）', async () => {
@@ -395,7 +400,8 @@ test('e2e: 超大图（>3.5MB）与非白名单图（bmp）→ 不读内容，�
   await flush(25);
   assert.equal(e.fetchCalls.length, 0, '超大/非白名单不浪费一次读');
   assert.equal(e.kernel.calls.create.length, 0);
-  assert.match(e.textarea.value, /\[拖入 2 个文件\]/);
+  assert.equal(e.textarea.value, '');
+  assert.deepEqual(Array.from(e.store.snapshotPending(e.inputActions), (x) => x.name), ['huge.png', 'icon.bmp']);
 });
 
 test('e2e: 宿主路由失败（旧宿主/未注册路由）→ 回退路径提示，不抛错不丢信息', async () => {
@@ -405,7 +411,7 @@ test('e2e: 宿主路由失败（旧宿主/未注册路由）→ 回退路径提�
   await flush(25);
   assert.equal(e.fetchCalls.filter((c) => c.url === '/dsh-file-drop/read-image').length, 1, '应尝试读图路由');
   assert.equal(e.kernel.calls.create.length, 0);
-  assert.ok(e.textarea.value.includes('C:\\t\\gone.png'), '读失败回退路径提示');
+  assert.deepEqual(Array.from(e.store.snapshotPending(e.inputActions), (x) => x.name), ['gone.png'], '读失败回退为附件 chip');
 });
 
 test('e2e: 无 fetch 能力（残留 file:// 壳）→ 同样回退路径提示', async () => {

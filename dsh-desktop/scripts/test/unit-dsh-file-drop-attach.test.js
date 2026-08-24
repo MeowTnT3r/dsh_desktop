@@ -351,13 +351,15 @@ async function setupApplied() {
   return {
     ...load, mod, ctx, kernel, inputActions, input, slotRegistrations, react, setDraftCalls,
     dom, textarea: dom.textarea, listeners: dom.listeners, dispatched: dom.dispatched,
+    store: load.sandbox.window.__dshFileDropStore,
   };
 }
 
-test('e2e: factory 物化 + apply 注册槽位按钮（accept 含内核白名单与文本扩展）', async () => {
+test('e2e: factory 物化 + apply 注册槽位按钮与附件 chip 条（accept 含内核白名单与文本扩展）', async () => {
   const e = await setupApplied();
-  assert.equal(e.slotRegistrations.length, 1);
+  assert.equal(e.slotRegistrations.length, 2);
   assert.equal(e.slotRegistrations[0].name, 'conversation.input.left');
+  assert.equal(e.slotRegistrations[1].name, 'conversation.input.left');
   // 槽位回调 → ctx.slots.register
   const entry = e.slotRegistrations[0].register();
   assert.equal(entry.options.id, 'dsh-file-drop-attach');
@@ -374,6 +376,11 @@ test('e2e: factory 物化 + apply 注册槽位按钮（accept 含内核白名单
   assert.ok(btn, '应有附件按钮');
   assert.equal(btn.props.disabled, false);
   assert.equal(typeof btn.props.onClick, 'function');
+  // 附件 chip 条组件在位（无待发文件时返回 null）。
+  const chipsEntry = e.slotRegistrations[1].register();
+  assert.equal(chipsEntry.options.id, 'dsh-file-drop-chips');
+  assert.equal(typeof chipsEntry.component, 'function');
+  assert.equal(chipsEntry.component({ inputActions: e.inputActions, input: e.input }), null);
 });
 
 test('e2e: 选 2 图 + 1 文本 + 1 拒绝项 → 官方管道收图、草稿得文本、红字给原因', async () => {
@@ -397,10 +404,12 @@ test('e2e: 选 2 图 + 1 文本 + 1 拒绝项 → 官方管道收图、草稿得
   assert.deepEqual(e.kernel.calls.create, ['shot.png', 'photo.jpg'], '仅两张白名单图进入官方管道');
   assert.ok(Array.isArray(e.kernel.lastAdded) && e.kernel.lastAdded.length === 2, '两张图 id 进入官方附件栏');
 
-  // 文本：setDraft 追加了带文件头的内容
-  assert.ok(e.setDraftCalls.length >= 1, '文本内容应追加草稿');
-  assert.match(e.setDraftCalls[0], /<!-- 拖入文件：note\.md -->/);
-  assert.match(e.setDraftCalls[0], /# hi/);
+  // 文本：成为附件 chip（内容随发送物化），不再追加草稿
+  assert.equal(e.setDraftCalls.length, 0, '文本不再追加草稿');
+  const pending = e.store.snapshotPending(e.inputActions);
+  assert.deepEqual(Array.from(pending, (x) => x.name), ['note.md'], '文本文件应成为待发附件 chip');
+  assert.equal(pending[0].kind, 'text');
+  assert.equal(pending[0].content, '# hi');
 
   // 拒绝项红字：组件 err state（useState stub 只能断言 flashErr 被调——
   // 通过返回树的 error span 不可见，改为断言不抛错且拒绝项未进任何通道。
@@ -489,7 +498,7 @@ test('e2e: HTML5 drop（内核已接管 defaultPrevented）白名单图片让位
   assert.ok(!e.textarea.value.includes('took.png'), '也不注入路径提示');
 });
 
-test('e2e: HTML5 drop 文本文件 → 内容注入（既有语义回归）', async () => {
+test('e2e: HTML5 drop 文本文件 → 附件 chip（内容随发送物化，不再注入输入框）', async () => {
   const e = await setupApplied();
   const entry = e.slotRegistrations[0].register();
   entry.component({ inputActions: e.inputActions, input: e.input });
@@ -500,8 +509,26 @@ test('e2e: HTML5 drop 文本文件 → 内容注入（既有语义回归）', as
     preventDefault() { this.defaultPrevented = true; },
   });
   await new Promise((r) => setTimeout(r, 25));
-  assert.match(e.textarea.value, /<!-- 拖入文件：readme\.md -->/);
-  assert.match(e.textarea.value, /hello-dropped/);
+  assert.equal(e.textarea.value, '', '不再注入内容进输入框');
+  const pending = e.store.snapshotPending(e.inputActions);
+  assert.deepEqual(Array.from(pending, (x) => x.name), ['readme.md']);
+  assert.equal(pending[0].kind, 'text');
+  assert.equal(pending[0].content, 'hello-dropped');
+});
+
+test('纯逻辑：materializePending 小内容 / 大路径（发送时物化）', () => {
+  const text = core.makePendingTextEntry('a.md', 5, '', 'hello');
+  assert.equal(text.kind, 'text');
+  const path = core.makePendingTextEntry('big.md', 5, 'C:\\big.md', 'x'.repeat(300 * 1024)); // 超 TEXT_MAX_BYTES → path
+  assert.equal(path.kind, 'path');
+  assert.equal(path.path, 'C:\\big.md');
+  const bin = core.makePendingPathEntry('b.zip', 10, 'C:\\b.zip');
+  assert.equal(bin.kind, 'path');
+  // 物化：小内容内联成附件注释块；大/二进制给路径提示。
+  const out = core.materializePending([text, path, bin]);
+  assert.match(out, /<!-- 附件：a\.md -->\nhello/);
+  assert.match(out, /完整路径：C:\\big\.md/);
+  assert.match(out, /完整路径：C:\\b\.zip/);
 });
 
 // ---------------------------------------------------------------------------

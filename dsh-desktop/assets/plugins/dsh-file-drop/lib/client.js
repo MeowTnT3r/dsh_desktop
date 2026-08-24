@@ -332,6 +332,40 @@
     return out;
   }
 
+  // ───────── 待发送文件附件（chip）纯逻辑 ─────────
+  // 非图片文件不再读内容写进输入框，而是暂存为「附件 chip」，发送时才物化：
+  //   · 小文本（≤TEXT_MAX_BYTES 且非二进制）→ 物化为内容（kind:'text'）；
+  //   · 大文本 / 二进制 / 无内容（桥层路径载荷）→ 物化为路径提示（kind:'path'）。
+  var pendingSeq = 0;
+
+  /** 文本文件 → chip 条目：内容可安全内联给 kind:'text'，超限/二进制回落 path。 */
+  function makePendingTextEntry(name, size, path, content) {
+    var text = String(content || '');
+    if (text.length > TEXT_MAX_BYTES || looksBinary(text)) {
+      return { id: 'f' + (++pendingSeq), name: name, size: size, kind: 'path', path: path || '' };
+    }
+    return { id: 'f' + (++pendingSeq), name: name, size: size, kind: 'text', content: text };
+  }
+
+  /** 二进制 / 桥层路径载荷 → chip 条目（只带路径，发送时让 agent 读文件）。 */
+  function makePendingPathEntry(name, size, path) {
+    return { id: 'f' + (++pendingSeq), name: name, size: size, kind: 'path', path: path || '' };
+  }
+
+  /** 发送时把待发附件物化为要追加到草稿的文本块（小内容 / 大路径）。 */
+  function materializePending(list) {
+    var parts = [];
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i];
+      if (it.kind === 'text') {
+        parts.push('<!-- 附件：' + (it.name || '未命名') + ' -->\n' + it.content);
+      } else {
+        parts.push(buildPathHint({ name: it.name, path: it.path, size: it.size }));
+      }
+    }
+    return parts.join('\n');
+  }
+
   // 暴露纯逻辑供测试；生产无副作用。
   var core = {
     TEXT_MAX_BYTES: TEXT_MAX_BYTES,
@@ -355,9 +389,68 @@
     planBridgeEntries: planBridgeEntries,
     RAIL_IMAGE_EXT_MIME: RAIL_IMAGE_EXT_MIME,
     addToOfficialRail: addToOfficialRail,
+    makePendingTextEntry: makePendingTextEntry,
+    makePendingPathEntry: makePendingPathEntry,
+    materializePending: materializePending,
   };
   if (typeof window !== 'undefined') {
     window.__dshFileDropCore = core;
+  }
+
+  // ───────── 待发送文件附件（chip）运行时状态（按会话 inputActions 隔离） ─────────
+  var pendingBySession = new Map();
+  var pendingListeners = [];
+  function notifyPending() {
+    for (var i = 0; i < pendingListeners.length; i++) { try { pendingListeners[i](); } catch (_e) { /* 订阅者异常不外溢 */ } }
+  }
+  function subscribePending(fn) {
+    if (typeof fn !== 'function' || pendingListeners.indexOf(fn) !== -1) return function () {};
+    pendingListeners.push(fn);
+    return function () { pendingListeners = pendingListeners.filter(function (x) { return x !== fn; }); };
+  }
+  function pendingOf(key) {
+    var list = pendingBySession.get(key);
+    if (!list) { list = []; pendingBySession.set(key, list); }
+    return list;
+  }
+  function addPending(key, entry) {
+    if (!key || !entry) return;
+    pendingOf(key).push(entry);
+    notifyPending();
+  }
+  function removePending(key, id) {
+    if (!key) return;
+    pendingBySession.set(key, pendingOf(key).filter(function (x) { return x.id !== id; }));
+    notifyPending();
+  }
+  function clearPending(key) {
+    if (!key) return;
+    pendingBySession.set(key, []);
+    notifyPending();
+  }
+  function snapshotPending(key) { return key ? pendingOf(key).slice() : []; }
+  function currentSessionKey() {
+    var env = currentRailEnv();
+    return env && env.inputActions;
+  }
+  // 统一落点：有槽位（会话上下文可用）→ 存 chip；无槽位（旧内核/file:// 壳，
+  // chip 无处渲染也无发送钩子）→ 回退路径提示/内容注入输入框，不丢信息。
+  function pendingOrFallback(entry) {
+    var key = currentSessionKey();
+    if (key) { addPending(key, entry); return; }
+    var text = entry && entry.kind === 'text'
+      ? ('<!-- 附件：' + (entry.name || '未命名') + ' -->\n' + entry.content)
+      : buildPathHint({ name: entry && entry.name, path: entry && entry.path, size: entry && entry.size });
+    injectIntoComposer(findComposer(), text);
+  }
+  if (typeof window !== 'undefined') {
+    window.__dshFileDropStore = {
+      snapshotPending: snapshotPending,
+      addPending: addPending,
+      removePending: removePending,
+      clearPending: clearPending,
+      subscribePending: subscribePending,
+    };
   }
 
   // ───────────────────────── DOM 粘合 ─────────────────────────
@@ -475,15 +568,21 @@
     return isFinite(n) && n >= 0 ? Math.floor(n) : 0;
   }
 
-  /** 合并路径提示块注入（列表为空时零副作用）。 */
-  function injectHintEntries(list) {
+  /** 桥层非图片条目 → 待发送附件 chip（列表为空时零副作用）。 */
+  function stageHintEntries(list) {
     try {
       if (!list || list.length === 0) return;
-      var composer = findComposer();
-      if (!injectIntoComposer(composer, core.buildDropHint(list))) {
-        showToast('未找到会话输入框，文件路径未能附加', true);
+      var key = currentSessionKey();
+      if (!key) {
+        // 无槽位（旧内核/file:// 壳）：chip 无处渲染，回退合并路径提示注入（既有语义）。
+        injectIntoComposer(findComposer(), core.buildDropHint(list));
+        return;
       }
-    } catch (_e) { /* 提示注入失败静默降级 */ }
+      for (var i = 0; i < list.length; i++) {
+        var it = list[i] || {};
+        addPending(key, makePendingPathEntry(it.name || '（未命名）', it.size, it.path));
+      }
+    } catch (_e) { /* 降级静默 */ }
   }
 
   function handleBridgeDrop(detail) {
@@ -494,7 +593,7 @@
       if (entries.length === 0) return;
       var plan = core.planBridgeEntries(entries);
       var hintEntries = plan.hint.slice();
-      if (plan.rail.length === 0) { injectHintEntries(hintEntries); return; }
+      if (plan.rail.length === 0) { stageHintEntries(hintEntries); return; }
       // rail 候选 → File：内容载荷免读直转；路径载荷经宿主路由读回。
       var railEntries = plan.rail;
       var jobs = [];
@@ -523,8 +622,8 @@
             if (pick.rail.indexOf(pending[q].file) === -1 || !r.ok) hintEntries.push(pending[q].entry);
           }
         }
-        injectHintEntries(hintEntries);
-      }).catch(function (_e) { injectHintEntries(hintEntries); });
+        stageHintEntries(hintEntries);
+      }).catch(function (_e) { stageHintEntries(hintEntries); });
     } catch (_e) { /* 整链失败静默降级 */ }
   }
 
@@ -550,7 +649,7 @@
       // 时退回路径提示（无路径也给可读指引）。
       var r = addToOfficialRail(currentRailEnv(), [file]);
       if (r.ok) return;
-      injectIntoComposer(findComposer(), buildPathHint({ name: name, path: path, size: size }));
+      pendingOrFallback(makePendingPathEntry(name, size, path));
       if (!path) showToast(r.error || '图片附件加入失败，已改用路径提示', true);
       return;
     }
@@ -559,17 +658,16 @@
     if (cls.kind === 'text') {
       var reader = new FileReader();
       reader.onload = function () {
-        var out = buildTextInsertion({ name: name, content: String(reader.result || ''), path: path, size: size });
-        injectIntoComposer(findComposer(), out.text);
+        pendingOrFallback(makePendingTextEntry(name, size, path, String(reader.result || '')));
       };
       reader.onerror = function () {
-        injectIntoComposer(findComposer(), buildPathHint({ name: name, path: path, size: size }));
+        pendingOrFallback(makePendingPathEntry(name, size, path));
       };
       reader.readAsText(file);
       return;
     }
 
-    injectIntoComposer(findComposer(), buildPathHint({ name: name, path: path, size: size }));
+    pendingOrFallback(makePendingPathEntry(name, size, path));
   }
 
   function hasFiles(types) {
@@ -641,6 +739,16 @@
     '.dsh-file-drop-attach-btn:disabled{opacity:.5;cursor:default}',
     '.dsh-file-drop-attach-err{font-size:12px;line-height:17px;color:var(--dsw-alias-state-error-primary,#ff7a85);',
     'max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '.dsh-file-drop-chips{display:flex;flex-wrap:wrap;gap:6px;padding:2px 0;}',
+    '.dsh-file-drop-chip{display:inline-flex;align-items:center;gap:6px;max-width:280px;padding:3px 8px;',
+    'font-size:12px;line-height:16px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-solid,#f2f2f4);',
+    'border:1px solid var(--dsw-alias-line-soft,#e2e2e6);border-radius:8px;overflow:hidden;}',
+    '.dsh-file-drop-chip--path{background:var(--dsw-alias-state-warn-soft,#fff6e6);border-color:var(--dsw-alias-state-warn-primary,#e0a63c);}',
+    '.dsh-file-drop-chip-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;}',
+    '.dsh-file-drop-chip-size{flex:none;color:var(--dsw-alias-label-secondary);font-size:11px;}',
+    '.dsh-file-drop-chip-x{flex:none;cursor:pointer;border:none;background:none;color:var(--dsw-alias-label-secondary);',
+    'font-size:14px;line-height:1;padding:0 2px;}',
+    '.dsh-file-drop-chip-x:hover{color:var(--dsw-alias-state-error-primary,#ff7a85);}',
   ].join('');
 
   function ensureCss() {
@@ -694,6 +802,30 @@
         return function () { if (railEnvRef === env) railEnvRef = null; };
       });
 
+      // 发送钩子：非图片文件以附件 chip 暂存，发送时物化进草稿（小内容/大路径）。
+      // 包装 inputActions.submit（会话级稳定 identity，发送按钮点击时才读
+      // inputActions.submit，故包装生效）；键盘 Enter 也走同一 submit。
+      var inputRef = useRef(input);
+      useEffect(function () { inputRef.current = input; });
+      useEffect(function () {
+        if (!inputActions || typeof inputActions.submit !== 'function' || typeof inputActions.setDraft !== 'function') return;
+        var orig = inputActions.submit;
+        inputActions.submit = function () {
+          var pending = snapshotPending(inputActions);
+          if (pending.length > 0) {
+            var cur = '';
+            var c = findComposer();
+            if (c && typeof c.value === 'string') cur = c.value;
+            else if (inputRef.current && typeof inputRef.current.draft === 'string') cur = inputRef.current.draft;
+            var text = materializePending(pending);
+            clearPending(inputActions);
+            if (text) inputActions.setDraft(cur + (cur ? '\n' : '') + text + '\n');
+          }
+          return orig();
+        };
+        return function () { inputActions.submit = orig; };
+      }, [inputActions]);
+
       var canAttach = !!(conversationOk(ctx) && typeof inputActions.addImages === 'function');
       var disabled = !canAttach;
 
@@ -729,7 +861,7 @@
       var btn = createElement('button', {
         type: 'button',
         className: 'dsh-file-drop-attach-btn',
-        title: '添加附件（图片直接发送给 DeepSeek；文本文件内容追加到输入框）',
+        title: '添加附件（图片直接发送给 DeepSeek；文本/代码等文件作为附件发送）',
         'aria-label': '添加附件',
         disabled: disabled,
         onClick: function () { if (!disabled && fileRef.current) fileRef.current.click(); },
@@ -752,6 +884,35 @@
         }, err) : null);
     }
 
+    // 非图片文件附件 chip 条：文件名 + 大小 + × 移除；发送时由钩子物化。
+    function FileChips(props) {
+      props = props || {};
+      var sessionKey = props.inputActions;
+      var state = useState(0);
+      var setTick = state[1];
+      useEffect(function () {
+        return subscribePending(function () { setTick(function (t) { return t + 1; }); });
+      }, []);
+      var items = snapshotPending(sessionKey);
+      if (items.length === 0) return null;
+      var chips = items.map(function (it) {
+        return createElement('span', {
+          key: it.id,
+          className: 'dsh-file-drop-chip' + (it.kind === 'path' ? ' dsh-file-drop-chip--path' : ''),
+          title: it.kind === 'path' ? (it.path || it.name) : (it.name + '（内容随消息发送）'),
+        },
+          createElement('span', { className: 'dsh-file-drop-chip-name' }, it.name),
+          createElement('span', { className: 'dsh-file-drop-chip-size' }, formatSize(it.size)),
+          createElement('button', {
+            type: 'button',
+            className: 'dsh-file-drop-chip-x',
+            'aria-label': '移除 ' + it.name,
+            onClick: function () { removePending(sessionKey, it.id); },
+          }, '×'));
+      });
+      return createElement('div', { className: 'dsh-file-drop-chips' }, chips);
+    }
+
     try {
       ctx.slots.inject('conversation.input.left', function () {
         return ctx.slots.register({
@@ -761,6 +922,19 @@
         }, AttachButton);
       }, 'dsh-file-drop: attach button');
     } catch (_e) { /* 槽位系统不可用（旧内核）：只保留拖放/粘贴路径 */ }
+
+    // 附件 chip 条：挂进输入框左侧（与 📎 按钮同槽，同样拿到 inputActions/
+    // input props）。不用 conversation.input.attachments——那是内核图片附件
+    // 专用槽，props 是 {attachments,canAcceptDrop,...} 无 inputActions。
+    try {
+      ctx.slots.inject('conversation.input.left', function () {
+        return ctx.slots.register({
+          name: 'conversation.input.left',
+          id: 'dsh-file-drop-chips',
+          order: 71, // 紧邻 📎 按钮（70）右侧
+        }, FileChips);
+      }, 'dsh-file-drop: file chips');
+    } catch (_e) { /* 槽位系统不可用：chip 不渲染，仅保留拖放/粘贴路径 */ }
   }
 
   function conversationOk(ctx) {
@@ -778,22 +952,19 @@
     var plan = core.planPickedFiles(files, env.railCount || 0);
     var onError = typeof env.onError === 'function' ? env.onError : function () {};
 
-    // 文本文件：读内容追加草稿（官方 setDraft；缺输入态时退回 textarea 注入）。
+    // 文本文件：读内容暂存为附件 chip（发送时再物化；选择器不携带路径，
+    // 超限/二进制无法给路径 → 报错提示拖入）。
     plan.text.forEach(function (file) {
       try {
         var reader = new FileReader();
         reader.onload = function () {
           try {
-            var out = buildTextInsertion({ name: file.name, content: String(reader.result || ''), path: '', size: file.size });
-            if (out.kind === 'path-hint') {
+            var entry = makePendingTextEntry(file.name, file.size, '', String(reader.result || ''));
+            if (entry.kind === 'path') {
               onError('「' + file.name + '」超过 ' + formatSize(TEXT_MAX_BYTES) + '，且选择器不携带路径；请拖入该文件或放入工作区让 agent 读取');
               return;
             }
-            if (env.inputActions && typeof env.inputActions.setDraft === 'function' && env.input && typeof env.input.draft === 'string') {
-              env.inputActions.setDraft(env.input.draft + out.text + '\n');
-            } else if (!injectIntoComposer(findComposer(), out.text)) {
-              onError('未找到会话输入框，' + file.name + ' 未能附加');
-            }
+            addPending(env.inputActions, entry);
           } catch (_e) { onError('读取 ' + file.name + ' 失败'); }
         };
         reader.onerror = function () { onError('读取 ' + file.name + ' 失败'); };
