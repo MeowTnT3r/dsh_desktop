@@ -249,7 +249,8 @@ fn zombie_probe_is_counter_driven_not_clock_driven() {
     assert!(z < 20, "19 次不杀");
     // 形态锚点。
     let src = norm(SUPERVISOR_SRC);
-    assert!(src.contains("if zombie >= 20"), "20 次阈值锚点");
+    assert!(src.contains("should_restart_zombie"), "假死重启抽纯函数 should_restart_zombie（#159 回合感知）");
+    assert!(src.contains("zombie >= ZOMBIE_THRESHOLD && active_turns == 0"), "20 次阈值 + 无回合才杀锚点");
     assert!(src.contains("std::thread::sleep(Duration::from_secs(3));"), "3s 中断时钟节拍锚点");
     assert!(src.contains("consecutive = 0;"), "成功清零锚点");
 }

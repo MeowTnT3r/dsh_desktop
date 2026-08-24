@@ -36,6 +36,13 @@ const SERVICE_STABLE_SECS: u64 = 45;
 const BOOT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
 /// WSL 分支看门狗上限（契约 §4.2）：npm 首装 30 分钟超时 + boot 链余量。
 const BOOT_WATCHDOG_TIMEOUT_WSL: Duration = Duration::from_secs(35 * 60);
+/// 假死判定阈值（HTTP 无响应连续探活次数；3s × 20 = 60s）。存在进行中
+/// agent 回合时豁免（issue #159），见 [`should_restart_zombie`]。
+const ZOMBIE_THRESHOLD: usize = 20;
+/// 假死「有回合」连续豁免上限（stale 计数兜底）：active_turns 因 watcher
+/// 崩溃/会话日志损坏而滞留 >0 时，最多再豁免 N 个阈值窗口（N×60s），之后
+/// 仍强制受控重启——保真死内核仍能被假死重启兜底（issue #159）。
+const ZOMBIE_DEFER_MAX: usize = 3;
 
 use shell_core::RunState;
 
@@ -1178,6 +1185,14 @@ impl Supervisor {
         matches!(s.read(&mut buf), Ok(n) if n > 0)
     }
 
+    /// 假死受控重启判定（纯函数，可单测）：HTTP 无响应连续次数达阈值且**无**
+    /// 进行中 agent 回合才重启。存在进行中回合时（内核正思考/压缩、事件循环
+    /// 被占导致 HTTP 无响应）豁免——issue #159 内核被强杀根因。真死内核（无
+    /// 回合）仍按原阈值受控重启，兜底不破坏。
+    fn should_restart_zombie(zombie: usize, active_turns: u64) -> bool {
+        zombie >= ZOMBIE_THRESHOLD && active_turns == 0
+    }
+
     fn probe_loop(self: &Arc<Self>, port: u16, tx: Sender<SupervisorEvent>, gen: u64, probe_gen: u64) {
         let this = Arc::clone(self);
         std::thread::spawn(move || {
@@ -1196,6 +1211,7 @@ impl Supervisor {
             //     会把崩溃自动重启刚拉起的新内核一并杀掉（复活-再杀循环）。
             let mut consecutive = 0usize;
             let mut zombie = 0usize;
+            let mut defer = 0usize; // 连续「有回合但 HTTP 无响应」的阈值窗口数（stale 兜底）
             loop {
                 std::thread::sleep(Duration::from_secs(3));
                 {
@@ -1217,10 +1233,12 @@ impl Supervisor {
                 if tcp_ok && Self::http_alive(port) {
                     consecutive = 0;
                     zombie = 0;
+                    defer = 0;
                     continue;
                 }
                 if !tcp_ok {
                     zombie = 0;
+                    defer = 0;
                     consecutive += 1;
                     let _ = tx.send(SupervisorEvent::ProbeFailed { consecutive });
                     if consecutive >= 3 {
@@ -1244,11 +1262,27 @@ impl Supervisor {
                 zombie += 1;
                 let _ = tx.send(SupervisorEvent::ZombieSuspect { consecutive: zombie });
                 log_line(&format!("内核假死可疑（端口通、HTTP 无响应）×{zombie}"));
-                if zombie >= 20 {
+                if Supervisor::should_restart_zombie(zombie, crate::session_notify::active_turns()) {
                     log_line("内核假死判定成立（连续 60s HTTP 无响应，20×3s 探活），受控重启");
                     this.kill_kernel();
                     this.on_kernel_exit(None, &tx);
                     return;
+                }
+                if zombie >= ZOMBIE_THRESHOLD {
+                    // 达阈值但存在进行中回合（内核正思考/压缩，事件循环被占 →
+                    // HTTP 无响应是预期）：不判死，复位计数继续观察——回合结束后
+                    // 若仍无响应，下一轮 20 次再判真死（issue #159）。defer 计数
+                    // 封顶：回合信号滞留（watcher 崩溃/日志损坏）也不让真死内核
+                    // 永远逃过假死重启兜底。
+                    defer += 1;
+                    if defer >= ZOMBIE_DEFER_MAX {
+                        log_line("内核假死且持续无响应（回合信号可能失效），强制受控重启");
+                        this.kill_kernel();
+                        this.on_kernel_exit(None, &tx);
+                        return;
+                    }
+                    log_line("内核假死可疑但存在进行中 agent 回合，延迟重启（复位计数继续观察）");
+                    zombie = 0;
                 }
             }
         });
@@ -1626,6 +1660,21 @@ impl WinFlags for Command {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// issue #159 假死判定「回合感知」：无进行中回合时达阈值判死（真死兜底），
+    /// 存在进行中回合时豁免（内核正工作不得误杀）。
+    #[test]
+    fn should_restart_zombie_respects_active_turns() {
+        // 真死内核（无回合）：达阈值即重启。
+        assert!(!Supervisor::should_restart_zombie(19, 0), "未达阈值不重启");
+        assert!(Supervisor::should_restart_zombie(20, 0), "达阈值且无回合 → 重启（真死兜底）");
+        assert!(Supervisor::should_restart_zombie(25, 0));
+        // 进行中回合：即便达阈值也不重启（内核正思考/压缩，HTTP 无响应是预期）。
+        assert!(!Supervisor::should_restart_zombie(20, 1), "有进行中回合不得重启");
+        assert!(!Supervisor::should_restart_zombie(100, 2), "回合数 >0 恒豁免");
+        // 回合结束（0）后恢复判死。
+        assert!(Supervisor::should_restart_zombie(20, 0));
+    }
 
     /// #122/#129 假死形态的确定性验证：TCP 握手被 OS 协议栈代答、应用层
     /// 永不响应——http_alive 必须判死（纯 TCP 探测恒活的正是这种形态）。
@@ -2322,9 +2371,9 @@ Content-Length: 0
         assert!(!koffi_preflight_passed(""));
     }
 
-    /// C2b 形态锚点：假死重启同计——probe_loop 的两条受控重启路径（TCP 失联
-    /// ×3 / 假死 ×20）必须经 on_kernel_exit(None) 走同一崩溃环判定（含 C2a
-    /// 慢环计数），不得绕开计数直接杀进程拉起。
+    /// C2b 形态锚点：假死重启同计——probe_loop 的三条受控重启路径（TCP 失联
+    /// ×3 / 假死 ×20 / 假死有回合豁免超限强制重启）必须经 on_kernel_exit(None)
+    /// 走同一崩溃环判定（含 C2a 慢环计数），不得绕开计数直接杀进程拉起。
     #[test]
     fn zombie_restart_shares_crash_loop_counter_shape() {
         let src = include_str!("supervisor.rs").replace("\r\n", "\n");
@@ -2334,7 +2383,7 @@ Content-Length: 0
             .and_then(|s| s.split("/// 原地重启").next())
             .expect("probe_loop 段");
         let calls = seg.matches("this.on_kernel_exit(None, &tx);").count();
-        assert_eq!(calls, 2, "假死（zombie≥20）与端口失联（consecutive≥3）两条路径都必须经 on_kernel_exit（C2b 同计）: {calls}");
+        assert_eq!(calls, 3, "假死（zombie≥20）与端口失联（consecutive≥3）与假死豁免超限三条路径都必须经 on_kernel_exit（C2b 同计）: {calls}");
         // on_kernel_exit 内部经 record_crash（计数判据入口）。
         let exit_seg = src
             .split("fn on_kernel_exit")

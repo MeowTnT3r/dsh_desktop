@@ -153,6 +153,11 @@ function runDshPlugin(pluginArgs, invokingDir, signal) {
   return { stdout: child.stdout, stderr: child.stderr, done, cancel };
 }
 
+/** `dsh plugin add <name>@<version> --save-exact …`（安装与更新共用同一命令形态）。 */
+function updateAddCommand(packageName, version, pnpmOptions = []) {
+  return ['add', `${packageName}@${version}`, '--save-exact', ...pnpmOptions];
+}
+
 // ---------------------------------------------------------------------------
 // cordis.patch.yml 手术（与壳层 patch-surgery 同文件格式语义的自包含实现）
 // 行级实现：顶层条目 = 行首 `- ` 开始到下一个行首 `- ` 前；insert 内层条目
@@ -426,6 +431,7 @@ class BridgePnpmService extends Service {
     super(ctx, 'desktopPnpm');
     this._profile = profile;
     this._receiptPackages = new Map();
+    this._updateReceipts = new Map();
   }
   runPlugin(args, invokingDir, signal) {
     return runDshPlugin(args, invokingDir ?? this._profile.dir, signal);
@@ -443,6 +449,24 @@ class BridgePnpmService extends Service {
     if (packageName === undefined) return false;
     this._receiptPackages.delete(receiptId);
     const handle = runDshPlugin(['remove', packageName], this._profile.dir, undefined);
+    const outcome = await handle.done;
+    return outcome.exitCode === 0;
+  }
+  /**
+   * 更新 = `dsh plugin add <name>@<newVersion> --save-exact …`（pnpm add 对已装
+   * 包即为精确升格），与 installPlugin 同命令形态、共用 registry 选项；把旧版本
+   * 记入回执表，失败时 rollbackPluginUpdate 用旧版本 re-add 还原（而非 remove）。
+   */
+  async updatePlugin(request) {
+    const { pnpmOptions = [], packageName, packageVersion, previousVersion, invokingDir, receiptId, signal } = request;
+    this._updateReceipts.set(receiptId, { packageName, previousVersion });
+    return runDshPlugin(updateAddCommand(packageName, packageVersion, pnpmOptions), invokingDir ?? this._profile.dir, signal);
+  }
+  async rollbackPluginUpdate(receiptId) {
+    const record = this._updateReceipts.get(receiptId);
+    if (record === undefined) return false;
+    this._updateReceipts.delete(receiptId);
+    const handle = runDshPlugin(updateAddCommand(record.packageName, record.previousVersion), this._profile.dir, undefined);
     const outcome = await handle.done;
     return outcome.exitCode === 0;
   }
@@ -589,4 +613,6 @@ export const __internals = {
   argvProfile,
   resolveProfileDirectory,
   runDshPlugin,
+  updateAddCommand,
+  BridgePnpmService,
 };

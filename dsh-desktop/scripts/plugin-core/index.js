@@ -40,6 +40,9 @@ function createPluginCenter(ctx) {
     log = () => {},
     companionPlugins = require('../lib/companion-plugins').COMPANION_PLUGINS,
     dialogs = { confirm: async () => false },
+    // 内核 agent 回合进行中信号（issue #159）：探活期间内核正思考/压缩
+    // （HTTP 无响应）时不得误判假死。由壳层把 session 流式/回合状态接进来。
+    getAgentBusy = () => false,
   } = ctx;
   const logTopic = (topic) => (msg) => log(topic, msg);
 
@@ -191,7 +194,7 @@ function createPluginCenter(ctx) {
     ...rest,
     getBaseUrl,
     httpGet,
-    isBusy: () => (isBusy ? isBusy() : false) || api.isMutating(),
+    isBusy: () => (isBusy ? isBusy() : false) || api.isMutating() || getAgentBusy(),
     onZombie,
     log: (m) => log('supervision', m),
   });

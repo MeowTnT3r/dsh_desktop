@@ -63,7 +63,20 @@ function startCli(sessionsDir) {
     while (lines.length === 0 && Date.now() < deadline) await sleep(100);
     return lines.length > 0 ? JSON.parse(lines[0]) : null;
   };
-  return { child, lines, stderr, waitLine };
+  // 等一条指定 type 的协议行（issue #159：CLI 现在也吐 turn-start 行，
+  // 通知类断言需跳过它精准等 turn-end）。命中即从 lines 移除。
+  const waitType = async (type, deadlineMs) => {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      const i = lines.findIndex((l) => {
+        try { return JSON.parse(l).type === type; } catch { return false; }
+      });
+      if (i >= 0) return JSON.parse(lines.splice(i, 1)[0]);
+      await sleep(100);
+    }
+    return null;
+  };
+  return { child, lines, stderr, waitLine, waitType };
 }
 
 async function stopCli(child) {
@@ -87,7 +100,7 @@ function assertProtocolShape(ev) {
   }
 }
 
-test('cli: mid-file garbage recovered turn/end emits one protocol line (baseline gap path)', async () => {
+test('cli: mid-file garbage recovered turn/end emits protocol lines (baseline gap path)', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'swcli-gap-'));
   const file = path.join(tmp, 'p1', 's1', 'session.jsonl.zstd');
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -96,14 +109,20 @@ test('cli: mid-file garbage recovered turn/end emits one protocol line (baseline
   fs.appendFileSync(file, frame([{ type: 'turn/start' }, { type: 'turn/end' }]));
   const cli = startCli(tmp);
   try {
-    const ev = await cli.waitLine(5000);
-    assert.ok(ev, '基线空隙路径应事件级吐行（setImmediate 首扫）');
+    // issue #159：turn/start 先于 turn/end 吐行（回合进行中信号）。
+    const start = await cli.waitType('turn-start', 5000);
+    assert.ok(start, '基线空隙路径应事件级吐 turn-start（setImmediate 首扫）');
+    assert.strictEqual(start.sessionId, 'sess-t1-abcdefgh');
+    assert.strictEqual(start.count, 1);
+    const ev = await cli.waitType('turn-end', 5000);
+    assert.ok(ev, '基线空隙路径应事件级吐 turn-end');
     assertProtocolShape(ev);
     assert.strictEqual(ev.sessionId, 'sess-t1-abcdefgh');
     assert.strictEqual(ev.title, 'DSH 任务完成', '无 session/title 事件 → 默认标题');
     assert.strictEqual(ev.body, 'fake · 会话 abcdefgh', 'cwd 基名 · 会话 尾8字符');
+    assert.strictEqual(ev.count, 1, '真实 turn/end 带 count');
     await sleep(800);
-    assert.strictEqual(cli.lines.length, 1, '恰一行');
+    assert.strictEqual(cli.lines.length, 0, 'turn-start + turn-end 恰两行（已消费）');
   } finally {
     await stopCli(cli.child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -119,17 +138,21 @@ test('cli: incremental turn/end via stat sweep; multi-turn aggregation suffix', 
     await sleep(800); // 让 setImmediate 基线扫描完成（连续文件 → 不吐行）
     assert.strictEqual(cli.lines.length, 0, '基线不吐行');
     appendFrame(file, [{ type: 'turn/start' }, { type: 'turn/end' }]);
-    let ev = await cli.waitLine(16000); // fs.watch 未挂载（30s 对账前）→ 10s 兜底清扫
+    const start = await cli.waitType('turn-start', 16000); // fs.watch 未挂载（30s 对账前）→ 10s 兜底清扫
+    assert.ok(start, '增量 turn/start 应经兜底清扫吐行');
+    assert.strictEqual(start.sessionId, 'sess-t2-12345678');
+    const ev = await cli.waitType('turn-end', 16000);
     assert.ok(ev, '增量 turn/end 应经兜底清扫吐行');
     assertProtocolShape(ev);
     assert.strictEqual(ev.sessionId, 'sess-t2-12345678');
-    // 同帧 3 个 turn/end → 恰一行聚合。
+    // 同帧 3 个 turn/end → 恰一行聚合（无 turn/start → 不吐 turn-start）。
     cli.lines.length = 0;
     appendFrame(file, [{ type: 'turn/end' }, { type: 'turn/end' }, { type: 'turn/end' }]);
-    ev = await cli.waitLine(16000);
-    assert.ok(ev, '聚合帧应吐行');
-    assert.ok(String(ev.body).includes('（3 轮任务完成）'), '3 轮聚合后缀: ' + ev.body);
-    assertProtocolShape(ev);
+    const ev2 = await cli.waitType('turn-end', 16000);
+    assert.ok(ev2, '聚合帧应吐行');
+    assert.ok(String(ev2.body).includes('（3 轮任务完成）'), '3 轮聚合后缀: ' + ev2.body);
+    assert.strictEqual(ev2.count, 3, '聚合 turn/end 带 count=3');
+    assertProtocolShape(ev2);
   } finally {
     await stopCli(cli.child);
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -147,8 +170,11 @@ test('cli: torn frame tail emits nothing until completed', async () => {
     await sleep(2500);
     assert.strictEqual(cli.lines.length, 0, '撕裂尾部不吐行');
     fs.appendFileSync(file, whole.subarray(whole.length - 4)); // 补齐
-    const ev = await cli.waitLine(16000);
-    assert.ok(ev, '补齐后应吐行');
+    const start = await cli.waitType('turn-start', 16000);
+    assert.ok(start, '补齐后应吐 turn-start');
+    assert.strictEqual(start.sessionId, 'sess-t3-abcdefgh');
+    const ev = await cli.waitType('turn-end', 16000);
+    assert.ok(ev, '补齐后应吐 turn-end');
     assertProtocolShape(ev);
     assert.strictEqual(ev.sessionId, 'sess-t3-abcdefgh');
   } finally {

@@ -226,7 +226,21 @@ function matchingInstallation(value, installations) {
 function isDesktopUnavailable(cause) {
   return cause !== null && typeof cause === "object" && "status" in cause && cause.status === 503;
 }
-function operationErrorMessage(cause, fallback) {
+var UPDATE_ERROR_MESSAGE_KEYS = {
+  UPDATE_NO_INTEGRITY: "updateErrorNoIntegrity",
+  UPDATE_INTEGRITY_MISMATCH: "updateErrorIntegrityMismatch",
+  UPDATE_BAD_URL: "updateErrorBadUrl",
+  UPDATE_ARCHIVE_UNSAFE: "updateErrorArchiveUnsafe",
+  UPDATE_PACKAGE_MISMATCH: "updateErrorPackageMismatch",
+  UPDATE_SCAN_BLOCKED: "updateErrorScanBlocked",
+  UPDATE_ROLLBACK_FAILED: "updateErrorRollbackFailed",
+  UPDATE_DOWNLOAD_FAILED: "updateErrorDownloadFailed"
+};
+function operationErrorMessage(cause, fallback, t) {
+  const code = cause !== null && typeof cause === "object" && "code" in cause ? cause.code : void 0;
+  if (typeof code === "string" && t !== void 0 && UPDATE_ERROR_MESSAGE_KEYS[code] !== void 0) {
+    return t(UPDATE_ERROR_MESSAGE_KEYS[code]);
+  }
   return cause instanceof Error && cause.message.trim().length > 0 ? cause.message : fallback;
 }
 function catalogFailureMessage(cause, source, t) {
@@ -729,7 +743,7 @@ function MarketSurface({ initialView = "installable", readLocale, t, showHeader 
         setInstallationsError(t("desktopUnavailable"));
         setOperationError(t("desktopUnavailable"));
       } else {
-        setOperationError(operationErrorMessage(cause, t(requestValue.action === "install" ? "previewError" : requestValue.action === "uninstall" ? "uninstallPreviewError" : requestValue.action === "disable" ? "disablePreviewError" : "enablePreviewError")));
+        setOperationError(operationErrorMessage(cause, t(requestValue.action === "install" ? "previewError" : requestValue.action === "uninstall" ? "uninstallPreviewError" : requestValue.action === "disable" ? "disablePreviewError" : requestValue.action === "update" ? "updatePreviewError" : "enablePreviewError"), t));
       }
     } finally {
       if (operationRequest.current === request) {
@@ -827,6 +841,7 @@ function MarketSurface({ initialView = "installable", readLocale, t, showHeader 
       if (result.action !== preview.action) throw new Error("operation response action mismatch");
       setInstallations((current) => {
         if (result.action === "install") return current;
+        if (result.action === "update") return current;
         if (result.action === "uninstall") {
           return current.filter((installation) => installation.kind !== "managed" || installation.receipt.receiptId !== result.receiptId);
         }
@@ -882,7 +897,7 @@ function MarketSurface({ initialView = "installable", readLocale, t, showHeader 
       setSelected(void 0);
       setOperationSuccess({ preview, restartToken: result.restartToken });
       if (result.action === "install" && viewRef.current === "installable") void loadInstallable();
-      if ((result.action === "uninstall" || result.action === "disable" || result.action === "enable") && viewRef.current === "installed") {
+      if ((result.action === "uninstall" || result.action === "disable" || result.action === "enable" || result.action === "update") && viewRef.current === "installed") {
         void loadInstallations();
       }
     } catch (cause) {
@@ -892,7 +907,7 @@ function MarketSurface({ initialView = "installable", readLocale, t, showHeader 
         setInstallationsError(t("desktopUnavailable"));
         setOperationError(t("desktopUnavailable"));
       } else {
-        setOperationError(operationErrorMessage(cause, t("executeError")));
+        setOperationError(operationErrorMessage(cause, t("executeError"), t));
       }
     } finally {
       if (operationRequest.current === request) {
@@ -1036,6 +1051,9 @@ function MarketSurface({ initialView = "installable", readLocale, t, showHeader 
             },
             onUninstall: (receipt) => {
               void beginOperationPreview({ action: "uninstall", receiptId: receipt.receiptId });
+            },
+            onUpdate: (receipt) => {
+              void beginOperationPreview({ action: "update", receiptId: receipt.receiptId });
             },
             onDisable: (bundleId) => {
               void beginOperationPreview({ action: "disable", bundleId });
@@ -1473,6 +1491,7 @@ function InstalledView(props) {
         installation,
         operationPending: props.operationPending,
         onUninstall: props.onUninstall,
+        onUpdate: props.onUpdate,
         onDisable: props.onDisable,
         onEnable: props.onEnable,
         t: props.t
@@ -1493,7 +1512,8 @@ function InstallationCard(props) {
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.StateDot, { state: installation.status === "disabled" ? "warning" : "done", size: 10 }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("h3", { children: displayName }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.Pill, { children: ownerLabel }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.Pill, { children: props.t(installation.status === "disabled" ? "disabledPlugin" : "activePlugin") })
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.Pill, { children: props.t(installation.status === "disabled" ? "disabledPlugin" : "activePlugin") }),
+        installation.updateAvailable === true && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.Pill, { children: `${props.t("updateAvailable")}: ${installation.latestVersion}` })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "dshMarketReceiptMeta", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { children: [
@@ -1514,6 +1534,18 @@ function InstallationCard(props) {
       ] })
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "dshMarketReceiptActions", children: [
+      installation.updateAvailable === true && installation.kind === "managed" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+        import_dsh_client_ui_primitives2.Button,
+        {
+          variant: "primary",
+          size: "sm",
+          "aria-label": `${props.t("update")}: ${displayName}`,
+          disabled: props.operationPending,
+          icon: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconDownloadOutline16, {}),
+          onClick: () => props.onUpdate(installation.receipt),
+          children: props.t("update")
+        }
+      ),
       installation.kind === "managed" && installation.status === "active" && installation.disableBundleId !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
         import_dsh_client_ui_primitives2.Button,
         {
@@ -1822,6 +1854,10 @@ function OperationFacts({ operation, showExpiry = true, t }) {
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("dt", { children: t("exactVersion") }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("dd", { children: operation.version })
     ] }),
+    operation.fromVersion !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("dt", { children: t("currentVersion") }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("dd", { children: operation.fromVersion })
+    ] }),
     /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("dt", { children: t("profile") }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("dd", { children: operation.profileName })
@@ -1837,9 +1873,10 @@ function OperationConfirmModal({ preview, pending, error, onCancel, onConfirm, t
   const uninstalling = preview.action === "uninstall";
   const disabling = preview.action === "disable";
   const enabling = preview.action === "enable";
-  const title = installing ? t("confirmInstallTitle") : uninstalling ? t("confirmUninstallTitle") : disabling ? t("confirmDisableTitle") : t("confirmEnableTitle");
-  const description = installing ? t("confirmInstallBody") : uninstalling ? t("confirmUninstallBody") : disabling ? t("confirmDisableBody") : t("confirmEnableBody");
-  const confirmLabel = pending ? installing ? t("installing") : uninstalling ? t("uninstalling") : disabling ? t("disabling") : t("enabling") : installing ? t("confirmInstall") : uninstalling ? t("confirmUninstall") : disabling ? t("confirmDisable") : t("confirmEnable");
+  const updating = preview.action === "update";
+  const title = installing ? t("confirmInstallTitle") : uninstalling ? t("confirmUninstallTitle") : disabling ? t("confirmDisableTitle") : updating ? t("confirmUpdateTitle") : t("confirmEnableTitle");
+  const description = installing ? t("confirmInstallBody") : uninstalling ? t("confirmUninstallBody") : disabling ? t("confirmDisableBody") : updating ? t("confirmUpdateBody") : t("confirmEnableBody");
+  const confirmLabel = pending ? installing ? t("installing") : uninstalling ? t("uninstalling") : disabling ? t("disabling") : updating ? t("updating") : t("enabling") : installing ? t("confirmInstall") : uninstalling ? t("confirmUninstall") : disabling ? t("confirmDisable") : updating ? t("confirmUpdate") : t("confirmEnable");
   return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
     import_dsh_client_ui_primitives2.Modal,
     {
@@ -1857,7 +1894,7 @@ function OperationConfirmModal({ preview, pending, error, onCancel, onConfirm, t
           {
             variant: "primary",
             disabled: pending,
-            icon: installing ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconDownloadOutline16, {}) : uninstalling ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconTrashOutline16, {}) : enabling ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconPlayOutline16, {}) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconPauseOutline16, {}),
+            icon: installing ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconDownloadOutline16, {}) : uninstalling ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconTrashOutline16, {}) : updating ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconDownloadOutline16, {}) : enabling ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconPlayOutline16, {}) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(import_dsh_client_ui_primitives2.IconPauseOutline16, {}),
             onClick: onConfirm,
             children: confirmLabel
           }
@@ -1905,7 +1942,7 @@ function OperationConfirmModal({ preview, pending, error, onCancel, onConfirm, t
   );
 }
 function OperationSuccessModal({ operation, canRestart, pending, error, onClose, onRestart, t }) {
-  const title = operation.preview.action === "install" ? t("installComplete") : operation.preview.action === "uninstall" ? t("uninstallComplete") : operation.preview.action === "disable" ? t("disableComplete") : t("enableComplete");
+  const title = operation.preview.action === "install" ? t("installComplete") : operation.preview.action === "uninstall" ? t("uninstallComplete") : operation.preview.action === "disable" ? t("disableComplete") : operation.preview.action === "update" ? t("updateComplete") : t("enableComplete");
   return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
     import_dsh_client_ui_primitives2.Modal,
     {
@@ -2322,7 +2359,24 @@ var zh = {
   catalogFailureTimeout: "\u76EE\u5F55\u8BF7\u6C42\u8D85\u65F6\u3002",
   catalogFailureInvalidResponse: "\u6765\u6E90\u8FD4\u56DE\u4E86\u65E0\u6CD5\u8BC6\u522B\u7684\u76EE\u5F55\u6570\u636E\u3002",
   catalogFailureUnavailable: "\u5F53\u524D\u65E0\u6CD5\u8FDE\u63A5\u8BE5\u76EE\u5F55\u6765\u6E90\u3002",
-  retry: "\u91CD\u8BD5"
+  retry: "\u91CD\u8BD5",
+  update: "\u66F4\u65B0",
+  updating: "\u6B63\u5728\u66F4\u65B0...",
+  updateAvailable: "\u6709\u53EF\u7528\u66F4\u65B0",
+  currentVersion: "\u5F53\u524D\u7248\u672C",
+  updatePreviewError: "\u65E0\u6CD5\u9A8C\u8BC1\u6B64\u63D2\u4EF6\u7684\u66F4\u65B0\u76EE\u6807\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002",
+  confirmUpdateTitle: "\u786E\u8BA4\u66F4\u65B0\u63D2\u4EF6",
+  confirmUpdateBody: "\u8BF7\u786E\u8BA4 DSH Desktop \u9A8C\u8BC1\u7684\u66F4\u65B0\u76EE\u6807\u4E0E\u7248\u672C\u3002",
+  confirmUpdate: "\u786E\u8BA4\u66F4\u65B0",
+  updateComplete: "\u63D2\u4EF6\u66F4\u65B0\u5B8C\u6210",
+  updateErrorNoIntegrity: "\u53D1\u5E03\u6E90\u672A\u63D0\u4F9B\u5B8C\u6574\u6027\u6821\u9A8C\u548C\uFF0C\u4E3A\u5B89\u5168\u8D77\u89C1\u62D2\u7EDD\u66F4\u65B0",
+  updateErrorIntegrityMismatch: "\u4E0B\u8F7D\u5185\u5BB9\u6821\u9A8C\u5931\u8D25\uFF0C\u5DF2\u4E2D\u6B62",
+  updateErrorBadUrl: "\u4E0B\u8F7D\u5730\u5740\u975E\u6CD5\uFF08\u4EC5\u5141\u8BB8 https\uFF09",
+  updateErrorArchiveUnsafe: "\u5F52\u6863\u5185\u5BB9\u5305\u542B\u4E0D\u5B89\u5168\u7684\u6761\u76EE\uFF0C\u5DF2\u4E2D\u6B62",
+  updateErrorPackageMismatch: "\u4E0B\u8F7D\u5185\u5BB9\u4E0E\u76EE\u6807\u63D2\u4EF6\u4E0D\u5339\u914D\uFF0C\u5DF2\u4E2D\u6B62",
+  updateErrorScanBlocked: "\u9759\u6001\u626B\u63CF\u53D1\u73B0\u9AD8\u5371\u5185\u5BB9\u4E14\u672A\u83B7\u786E\u8BA4\uFF0C\u5DF2\u4E2D\u6B62",
+  updateErrorRollbackFailed: "\u56DE\u6EDA\u5931\u8D25\uFF0C\u5907\u4EFD\u4FDD\u7559\u5728 .bak \u76EE\u5F55",
+  updateErrorDownloadFailed: "\u4E0B\u8F7D\u5931\u8D25"
 };
 var en = {
   tab: "Plugin Market",
@@ -2469,7 +2523,24 @@ var en = {
   catalogFailureTimeout: "The catalog request timed out.",
   catalogFailureInvalidResponse: "The source returned catalog data that could not be read.",
   catalogFailureUnavailable: "The catalog source could not be reached.",
-  retry: "Retry"
+  retry: "Retry",
+  update: "Update",
+  updating: "Updating...",
+  updateAvailable: "Update available",
+  currentVersion: "Current version",
+  updatePreviewError: "The update target could not be verified. Refresh and try again.",
+  confirmUpdateTitle: "Confirm plugin update",
+  confirmUpdateBody: "Confirm the DSH Desktop-verified update target and version.",
+  confirmUpdate: "Confirm update",
+  updateComplete: "Plugin updated",
+  updateErrorNoIntegrity: "The release source did not provide an integrity checksum, so the update was refused for safety.",
+  updateErrorIntegrityMismatch: "Downloaded content failed verification and was aborted.",
+  updateErrorBadUrl: "The download URL is invalid (only https is allowed).",
+  updateErrorArchiveUnsafe: "The archive contains unsafe entries and was aborted.",
+  updateErrorPackageMismatch: "The downloaded content does not match the target plugin and was aborted.",
+  updateErrorScanBlocked: "Static scanning found high-risk content that was not confirmed; aborted.",
+  updateErrorRollbackFailed: "Rollback failed; the backup is kept in the .bak directory.",
+  updateErrorDownloadFailed: "Download failed."
 };
 
 // src/client/styles.ts

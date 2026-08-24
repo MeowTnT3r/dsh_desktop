@@ -85,6 +85,52 @@ test('running→done：基线后追加 turn/end 恰好通知一次，文案同 E
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('turn/start 触发 onTurnStart；真实 turn/end 带 turnBased=true + count', () => {
+  const dir = tmpSessionsDir('turn-start');
+  const s = makeSession(dir, SID, [header()]);
+  const starts = [];
+  const ends = [];
+  const w = new SessionWatcher({
+    sessionsDir: dir,
+    onTurnStart: (info) => starts.push(info),
+    onTurnEnd: (info) => ends.push(info),
+    log: () => {},
+    statSweepMs: 60_000,
+    walkSweepMs: 60_000,
+  });
+  w.process(s.file); // 基线（无 turn 事件 → 零通知）
+  s.append([{ type: 'turn/start' }, { type: 'turn/end' }]);
+  w.process(s.file);
+  assert.strictEqual(starts.length, 1, 'turn/start 恰好触发一次 onTurnStart');
+  assert.strictEqual(starts[0].sessionId, SID);
+  assert.strictEqual(starts[0].count, 1);
+  assert.strictEqual(ends.length, 1, 'turn/end 恰好触发一次 onTurnEnd');
+  assert.strictEqual(ends[0].turnBased, true, '真实 turn/end 标记 turnBased=true');
+  assert.strictEqual(ends[0].count, 1);
+  w.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('assistant/message 兜底 turn-end 不带 turnBased（不误消进行中回合）', () => {
+  const dir = tmpSessionsDir('fallback-flag');
+  const s = makeSession(dir, SID, [header()]);
+  const ends = [];
+  const w = new SessionWatcher({
+    sessionsDir: dir,
+    onTurnEnd: (info) => ends.push(info),
+    log: () => {},
+    statSweepMs: 60_000,
+    walkSweepMs: 60_000,
+  });
+  w.process(s.file); // 基线
+  s.append([{ type: 'assistant/message' }]);
+  w.process(s.file);
+  assert.strictEqual(ends.length, 1, '兜底通知触发');
+  assert.strictEqual(ends[0].turnBased, false, '兜底通知 turnBased=false');
+  w.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('running（turn/start 无 end）不判完；撕裂帧不误报且能恢复后续帧', () => {
   const dir = tmpSessionsDir('interrupt');
   const s = makeSession(dir, SID, [header(), { type: 'turn/start' }]);

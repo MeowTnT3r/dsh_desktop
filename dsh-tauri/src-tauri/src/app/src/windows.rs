@@ -100,13 +100,25 @@ pub fn create_main_window(
             }
         }
         if let tauri::WindowEvent::CloseRequested { api, .. } = e {
-            // 0.5.0 语义：关窗（系统 Alt+F4 / 任务栏关闭 / WM_CLOSE）= 隐藏主窗
-            // 留托盘，后台常驻、内核继续跑；真退出（杀树）走托盘「退出」。
-            // prevent_close 必须显式调：不拦则窗口走默认销毁（0.1.0 为此曾
-            // 在此直接退进程——Review#2 实测默认销毁会留无窗僵尸）。
-            api.prevent_close();
-            if let Some(w) = handle.get_webview_window("main") {
-                hide_main_to_tray(&w);
+            // #160：关窗读 closeToTray（缺省 true，Electron `s.closeToTray !== false`
+            // 同口径）——true 才 prevent_close + hide 到托盘（后台常驻、内核继续
+            // 跑）；false 放行默认销毁：主窗为最后窗口时 tauri-runtime 触发
+            // ExitRequested → 真退出（杀树仍走托盘「退出」/ExitRequested 的
+            // supervisor.shutdown 路径，此处不再直接退进程）。
+            let close_to_tray = handle
+                .try_state::<crate::AppState>()
+                .map(|state| {
+                    let store = shell_core::SettingsStore::new(state.paths.settings.clone());
+                    close_to_tray_from_store(&store)
+                })
+                // 拿不到 AppState（异常启动态）保守按 true：宁隐藏留托盘，不误退。
+                .unwrap_or(true);
+            if close_to_tray {
+                // prevent_close 必须显式调：不拦则窗口走默认销毁。
+                api.prevent_close();
+                if let Some(w) = handle.get_webview_window("main") {
+                    hide_main_to_tray(&w);
+                }
             }
         }
     });
@@ -288,6 +300,14 @@ static PET_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 同口径）；未设置/损坏/非布尔一律不弹。
 pub fn pet_auto_open_from_store(store: &shell_core::SettingsStore) -> bool {
     store.get("pet.autoOpen").ok().flatten().and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// #160：读 settings.json 的 closeToTray（写侧 commands/menu.rs `toggle_setting`
+/// 经 `toggle-close-to-tray`，扁平键）。缺省 **true**——对齐 Electron
+/// `closeToTrayEnabled()` 的 `s.closeToTray !== false`（仅显式 false 才直接退出，
+/// 未设置/损坏/非布尔一律关到托盘，绝不因坏配置误退丢会话）。
+pub fn close_to_tray_from_store(store: &shell_core::SettingsStore) -> bool {
+    store.get("closeToTray").ok().flatten().and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
 /// G3：主窗最小化时应否自动弹宠物窗（纯判定，供事件分支与单测共用）。
@@ -881,9 +901,10 @@ mod tests {
         assert!(seg.contains(".initialization_script(BRIDGE_SHIM_JS)"), "桥垫片不得回退丢失: {seg}");
     }
 
-    /// 主窗 CloseRequested 语义（0.5.0）：拦截默认销毁 → 隐藏留托盘。
-    /// 源码形态断言（WebviewWindow 无法在单测构造），防回退到 exit(0)
-    /// （0.1.0 语义：关窗即退）或漏 prevent_close（无窗僵尸进程）。
+    /// 主窗 CloseRequested 语义（#160）：读 closeToTray——true（缺省）拦截默认
+    /// 销毁 → 隐藏留托盘；false 放行默认销毁 → 真退出。源码形态断言（WebviewWindow
+    /// 无法在单测构造），防回退到无条件 prevent_close（#160 假开关）或 exit(0)
+    /// （0.1.0 语义：关窗即退）。
     #[test]
     fn close_requested_hides_instead_of_exit_shape() {
         let src = include_str!("windows.rs");
@@ -892,9 +913,44 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("/// 浮窗").next())
             .expect("CloseRequested 处理段");
-        assert!(seg.contains("prevent_close"), "必须拦截默认窗口销毁: {seg}");
-        assert!(seg.contains("hide_main_to_tray"), "关窗 = 隐藏留托盘（非退出）: {seg}");
-        assert!(!seg.contains("exit(0)"), "关窗不得直接退出进程（真退出走托盘）: {seg}");
+        assert!(seg.contains("close_to_tray_from_store"), "必须读 closeToTray 设置: {seg}");
+        assert!(seg.contains("if close_to_tray"), "必须以 closeToTray 门控: {seg}");
+        assert!(seg.contains("prevent_close"), "true 分支必须拦截默认窗口销毁: {seg}");
+        assert!(seg.contains("hide_main_to_tray"), "true 分支关窗 = 隐藏留托盘（非退出）: {seg}");
+        assert!(!seg.contains("exit(0)"), "关窗不得直接退出进程（真退出走托盘/ExitRequested）: {seg}");
+    }
+
+    /// #160：closeToTray 读取口径——缺省 true（关到托盘）；仅显式 false 才放行
+    /// 直接退出；显式 true / 非布尔 / 损坏一律回落 true（Electron
+    /// `s.closeToTray !== false` 同口径，绝不因坏配置误退丢会话）。
+    #[test]
+    fn close_to_tray_reads_flat_key_defaults_true() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("dsh-close-to-tray-{}-{}.json", std::process::id(), line!()));
+        let _ = std::fs::remove_file(&path);
+        let store = shell_core::SettingsStore::new(&path);
+        // 缺省：未写入 → true（关到托盘）。
+        assert!(close_to_tray_from_store(&store));
+        // 显式 false → 放行直接退出。
+        store.set("closeToTray", serde_json::json!(false)).unwrap();
+        assert!(!close_to_tray_from_store(&store));
+        // 显式 true → 关到托盘。
+        store.set("closeToTray", serde_json::json!(true)).unwrap();
+        assert!(close_to_tray_from_store(&store));
+        // 非布尔（字符串）→ 回落缺省 true。
+        store.set("closeToTray", serde_json::json!("yes")).unwrap();
+        assert!(close_to_tray_from_store(&store));
+        let _ = std::fs::remove_file(&path);
+
+        // 损坏文件 → load 自愈为空 → 回落 true（关到托盘，不误退）。
+        let mut bad = std::env::temp_dir();
+        bad.push(format!("dsh-close-to-tray-bad-{}-{}.json", std::process::id(), line!()));
+        let _ = std::fs::remove_file(&bad);
+        std::fs::write(&bad, "{not json").unwrap();
+        let broken = shell_core::SettingsStore::new(&bad);
+        assert!(close_to_tray_from_store(&broken));
+        let _ = std::fs::remove_file(&bad);
+        let _ = std::fs::remove_file(bad.with_extension("json.broken"));
     }
 
     /// hide_main_to_tray 先存状态再隐藏（隐藏后可能经强杀路径退出，

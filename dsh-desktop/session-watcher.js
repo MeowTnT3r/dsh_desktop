@@ -134,9 +134,12 @@ function expandRow(line) {
 }
 
 class SessionWatcher {
-  constructor({ sessionsDir, onTurnEnd, log, statSweepMs, walkSweepMs }) {
+  constructor({ sessionsDir, onTurnEnd, onTurnStart, log, statSweepMs, walkSweepMs }) {
     this.sessionsDir = sessionsDir;
     this.onTurnEnd = onTurnEnd || (() => {});
+    // 回合进行中信号（供内核探活环「忙碌」判定）：顶层会话看到 turn/start
+    // 即进入进行中、turn/end 即结束。默认 noop——Electron 通知路径不受影响。
+    this.onTurnStart = onTurnStart || (() => {});
     this.log = log || (() => {});
     this.files = new Map(); // absPath -> { consumed, lastSize, header, title, baseline }
     this.dirCache = { at: 0, files: [] };
@@ -332,6 +335,7 @@ class SessionWatcher {
       }
       // 有损坏空隙时，把垃圾区之后恢复的帧纳入计数，避免 turn/end 被吞。
       if (hasGap) {
+        let turnStarts = 0;
         let turnEnds = 0;
         let assistantMessages = 0;
         for (const f of frames) {
@@ -343,13 +347,15 @@ class SessionWatcher {
               if (!ev || typeof ev !== 'object') continue;
               if (ev.type === 'session/title' && ev.data && typeof ev.data.title === 'string') rec.title = ev.data.title;
               if (ev.type === 'turn/start' || ev.type === 'turn/end') rec.hasTurnEvents = true;
+              if (ev.type === 'turn/start') turnStarts += 1;
               if (ev.type === 'turn/end') turnEnds += 1;
               if (ev.type === 'assistant/message') assistantMessages += 1;
             }
           }
         }
+        if (turnStarts > 0) this.emitStart(rec, turnStarts);
         const count = rec.hasTurnEvents ? turnEnds : assistantMessages;
-        if (count > 0) this.emit(rec, count);
+        if (count > 0) this.emit(rec, count, rec.hasTurnEvents);
       }
       // 没有完整帧则不推进（tornStart 提示未写满）。
       rec.baseline = true;
@@ -358,6 +364,7 @@ class SessionWatcher {
     }
 
     // 增量：只解码 consumed 之后的新完整帧。
+    let turnStarts = 0;
     let turnEnds = 0;
     let assistantMessages = 0;
     let consumed = readFrom;
@@ -370,6 +377,7 @@ class SessionWatcher {
           if (!ev || typeof ev !== 'object') continue;
           if (ev.type === 'session/title' && ev.data && typeof ev.data.title === 'string') rec.title = ev.data.title;
           if (ev.type === 'turn/start' || ev.type === 'turn/end') rec.hasTurnEvents = true;
+          if (ev.type === 'turn/start') turnStarts += 1;
           if (ev.type === 'turn/end') turnEnds += 1;
           if (ev.type === 'assistant/message') assistantMessages += 1;
         }
@@ -379,13 +387,15 @@ class SessionWatcher {
     rec.consumed = consumed;
     rec.lastSize = st.size;
 
+    // 回合进行中信号先于完成通知（探活环据此判定「忙碌」不误杀）。
+    if (turnStarts > 0) this.emitStart(rec, turnStarts);
     // 通知语义：会话出现 turn 事件后按 turn/end 计数，否则按 assistant/message 兜底。
     const count = rec.hasTurnEvents ? turnEnds : assistantMessages;
-    if (count > 0) this.emit(rec, count);
-    return count > 0 || consumed > readFrom;
+    if (count > 0) this.emit(rec, count, rec.hasTurnEvents);
+    return count > 0 || turnStarts > 0 || consumed > readFrom;
   }
 
-  emit(rec, count) {
+  emit(rec, count, turnBased) {
     const h = rec.header || {};
     if (h.delegationDepth > 0) return; // subagent logs are noise for toasts
     let title = 'DSH 任务完成';
@@ -398,8 +408,18 @@ class SessionWatcher {
     const shortId = typeof h.id === 'string' ? h.id.slice(-8) : null;
     body = [cwdBase, shortId ? '会话 ' + shortId : null].filter(Boolean).join(' · ');
     body += (count > 1 ? '（' + count + ' 轮任务完成）' : '');
-    try { this.onTurnEnd({ title, body, sessionId: h.id, cwd: h.cwd }); }
+    // turnBased=true 表示 count 是真实 turn/end 数（非 assistant/message 兜底），
+    // 供壳侧回合进行中计数精确减一（兜底路径不携带 count，见 CLI 段）。
+    try { this.onTurnEnd({ title, body, sessionId: h.id, cwd: h.cwd, count, turnBased: turnBased === true }); }
     catch (err) { this.log('watch', 'onTurnEnd 回调异常: ' + err.message); }
+  }
+
+  /** 回合开始信号（探活环「忙碌」判定源）：顶层会话看到 turn/start 即上报。 */
+  emitStart(rec, count) {
+    const h = rec.header || {};
+    if (h.delegationDepth > 0) return; // subagent 不参与内核忙碌判定
+    try { this.onTurnStart({ sessionId: h.id, count }); }
+    catch (err) { this.log('watch', 'onTurnStart 回调异常: ' + err.message); }
   }
 }
 
@@ -425,14 +445,30 @@ if (require.main === module) {
     log: function (tag, msg) {
       try { process.stderr.write('[' + tag + '] ' + msg + '\n'); } catch {}
     },
-    onTurnEnd: function (info) {
+    onTurnStart: function (info) {
       try {
         process.stdout.write(JSON.stringify({
+          type: 'turn-start',
+          sessionId: typeof info.sessionId === 'string' ? info.sessionId : null,
+          count: typeof info.count === 'number' && info.count > 0 ? info.count : 1,
+        }) + '\n');
+      } catch {
+        try { watcher.stop(); } catch {}
+        process.exit(0);
+      }
+    },
+    onTurnEnd: function (info) {
+      try {
+        const line = {
           type: 'turn-end',
           sessionId: typeof info.sessionId === 'string' ? info.sessionId : null,
           title: typeof info.title === 'string' ? info.title : null,
           body: typeof info.body === 'string' ? info.body : null,
-        }) + '\n');
+        };
+        // 真实 turn/end 才带 count（供壳侧回合进行中计数精确减）；assistant/message
+        // 兜底通知不携带，壳侧不减（避免旧会话兜底误消进行中的真实回合）。
+        if (info.turnBased === true) line.count = typeof info.count === 'number' && info.count > 0 ? info.count : 1;
+        process.stdout.write(JSON.stringify(line) + '\n');
       } catch {
         // stdout 已断（父进程退出中）：安静退出，不留孤儿。
         try { watcher.stop(); } catch {}

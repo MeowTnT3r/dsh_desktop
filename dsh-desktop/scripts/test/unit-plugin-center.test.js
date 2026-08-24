@@ -82,6 +82,7 @@ function makeCenter(t, opts = {}) {
     getProfile: () => 'web',
     log: (topic, msg) => logs.push(topic + ': ' + msg),
     dialogs: opts.dialogs || { confirm: async () => true },
+    getAgentBusy: opts.getAgentBusy || (() => false),
   });
 
   return {
@@ -454,6 +455,34 @@ test('supervision: api.isMutating 接线到 isBusy（变更进行中不触发假
   await hold;
   await pending;
   assert.equal(c.center.isMutating(), false, '变更完成后 isMutating 归假');
+  sup.stop();
+});
+
+test('supervision: getAgentBusy 接线到 isBusy（agent 回合进行中不触发假活）', async (t) => {
+  let agentBusy = false;
+  const c = makeCenter(t, { getAgentBusy: () => agentBusy });
+  const clock = withFakeClock(t);
+
+  let zombie = 0;
+  const sup = c.center.supervision({
+    getBaseUrl: () => 'http://127.0.0.1:8321',
+    httpGet: async () => ({ statusCode: 0 }),
+    isBusy: () => false, // 用户侧判忙恒假，只有 getAgentBusy 能拦下
+    onZombie: () => { zombie += 1; },
+  });
+
+  clock.now = 0;
+  sup.start();
+  clock.now = 500000;
+  agentBusy = true;
+  await sup.tick();
+  await sup.tick();
+  await sup.tick();
+  assert.equal(zombie, 0, 'agent 回合进行中 isBusy 为真 → 不触发 onZombie');
+
+  agentBusy = false;
+  await sup.tick();
+  assert.equal(zombie, 1, '回合结束后继续失败 → 触发 onZombie（真死兜底）');
   sup.stop();
 });
 

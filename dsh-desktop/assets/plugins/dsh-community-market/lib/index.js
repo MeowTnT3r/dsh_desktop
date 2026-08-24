@@ -3598,7 +3598,7 @@ function createMarketMediaService(options = {}) {
 import { randomBytes as randomBytes2, randomUUID as randomUUID2 } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join as join2, relative, resolve as resolve2 } from "node:path";
-import { prerelease, satisfies, valid } from "semver";
+import { gt, prerelease, satisfies, valid } from "semver";
 import { parse as parseYaml } from "yaml";
 
 // src/install/manual.ts
@@ -3954,6 +3954,7 @@ var MarketInstallService = class {
     this.maxIntents = options.maxIntents ?? MAX_INTENTS;
     this.maxCandidates = options.maxCandidates ?? MAX_CANDIDATES;
     this.disabledPackageNames = options.disabledPackageNames ?? (() => []);
+    this.assertInstalled = options.assertInstalled ?? assertInstalledBundle;
     for (const [label, value] of [
       ["intent TTL", this.intentTtlMs],
       ["candidate TTL", this.candidateTtlMs],
@@ -4226,7 +4227,7 @@ var MarketInstallService = class {
     if (intent === void 0) {
       throw new MarketInstallError("intent-expired", "The confirmation expired or was already used. Preview the operation again.");
     }
-    const result = intent.kind === "install" ? { action: "install", ...await this.executeInstall(token, signal), restartToken: this.issueRestartToken() } : { action: "uninstall", ...await this.executeUninstall(token, signal), restartToken: this.issueRestartToken() };
+    const result = intent.kind === "install" ? { action: "install", ...await this.executeInstall(token, signal), restartToken: this.issueRestartToken() } : intent.kind === "update" ? { action: "update", ...await this.executeUpdate(token, signal), restartToken: this.issueRestartToken() } : { action: "uninstall", ...await this.executeUninstall(token, signal), restartToken: this.issueRestartToken() };
     return result;
   }
   /** Consume one short-lived restart grant issued only after a completed mutation. */
@@ -4300,6 +4301,187 @@ var MarketInstallService = class {
         throw new MarketInstallError("persistence-failed", "The plugin was removed, but its market receipt could not be updated.");
       }
       return { receiptId: currentReceipt.receiptId, packageName: currentReceipt.packageName };
+    });
+  }
+  /**
+   * 更新可用性检查（checkUpdates）：对每个市场回执，用当前已扫描目录候选中
+   * 的 latestVersion 与回执安装版本做严格升格比较。不回退、不改文件，命中
+   * 新版本才返回 updateAvailable: true。
+   */
+  async checkUpdates(signal = this.generation.signal) {
+    const operationSignal = this.operationSignal(signal);
+    await this.ensureRecoveredInstallReconciled();
+    operationSignal.throwIfAborted();
+    const profile = this.profile();
+    const receipts = this.receipts().filter((receipt) => receipt.profileName === profile.name);
+    const updates = [];
+    for (const receipt of receipts) {
+      const candidate = this.candidates.get(candidateKey2(receipt.sourceRecordId, receipt.itemId));
+      if (candidate === void 0 || candidate.packageName !== receipt.packageName) continue;
+      if (gt(candidate.version, receipt.version)) {
+        updates.push({
+          receiptId: receipt.receiptId,
+          packageName: receipt.packageName,
+          displayName: receipt.displayName,
+          version: receipt.version,
+          latestVersion: candidate.version,
+          updateAvailable: true
+        });
+      }
+    }
+    return updates;
+  }
+  async previewUpdate(receiptId, signal) {
+    const operationSignal = this.operationSignal(signal);
+    await this.ensureRecoveredInstallReconciled();
+    operationSignal.throwIfAborted();
+    this.purge();
+    const profile = this.profile();
+    const receipt = this.receipts().find((value) => value.receiptId === receiptId && value.profileName === profile.name);
+    if (receipt === void 0) {
+      throw new MarketInstallError("not-available", "This plugin is not owned by a market install receipt in the active profile.");
+    }
+    try {
+      await this.assertInstalled(profile, receipt.packageName, receipt.version, receipt.bundlePatch, receipt.integrity);
+      operationSignal.throwIfAborted();
+    } catch {
+      throw new MarketInstallError("conflict", "The installed plugin no longer matches its market receipt.");
+    }
+    const key = candidateKey2(receipt.sourceRecordId, receipt.itemId);
+    const candidate = this.candidates.get(key);
+    if (candidate === void 0 || candidate.packageName !== receipt.packageName) {
+      throw new MarketInstallError("not-available", "No verified update target is available. Refresh the active source and try again.");
+    }
+    if (!gt(candidate.version, receipt.version)) {
+      throw new MarketInstallError("not-available", "This plugin is already up to date.");
+    }
+    let verification;
+    try {
+      verification = await this.verifier.verify(candidate, operationSignal);
+    } catch (cause) {
+      operationSignal.throwIfAborted();
+      throw cause;
+    }
+    operationSignal.throwIfAborted();
+    this.assertOpen();
+    if (this.candidates.get(key) !== candidate) {
+      throw new MarketInstallError("not-available", "The catalog source changed during verification. Refresh it and try again.");
+    }
+    const token = this.issueIntent({
+      kind: "update",
+      receipt,
+      candidate,
+      verification,
+      profile,
+      expiresAt: this.now() + this.intentTtlMs
+    });
+    return {
+      intent: token,
+      action: "update",
+      profileName: profile.name,
+      packageName: candidate.packageName,
+      version: candidate.version,
+      fromVersion: receipt.version,
+      displayName: receipt.displayName,
+      expiresAt: new Date(this.now() + this.intentTtlMs).toISOString()
+    };
+  }
+  async runUpdatePlugin(candidate, previousVersion, receiptId, profile, signal) {
+    const combinedSignal = AbortSignal.any([signal, this.generation.signal]);
+    combinedSignal.throwIfAborted();
+    let handle;
+    try {
+      handle = await this.pnpm.updatePlugin({
+        packageName: candidate.packageName,
+        packageVersion: candidate.version,
+        previousVersion,
+        invokingDir: profile.dir,
+        receiptId,
+        pnpmOptions: this.installOptions(candidate.packageName),
+        signal: combinedSignal
+      });
+    } catch {
+      throw new MarketInstallError("operation-failed", "The desktop package manager could not start the update.");
+    }
+    handle.stdout.resume();
+    handle.stderr.resume();
+    const cancel = () => handle.cancel();
+    combinedSignal.addEventListener("abort", cancel, { once: true });
+    let outcome;
+    try {
+      outcome = await handle.done;
+    } catch {
+      combinedSignal.throwIfAborted();
+      throw new MarketInstallError("operation-failed", "The desktop package manager failed during the update.");
+    } finally {
+      combinedSignal.removeEventListener("abort", cancel);
+    }
+    combinedSignal.throwIfAborted();
+    if (outcome.exitCode !== 0 || outcome.signal !== null) {
+      throw new MarketInstallError("operation-failed", "The desktop package manager did not complete the update.");
+    }
+  }
+  async executeUpdate(token, signal) {
+    return await this.runExclusive(async () => {
+      const operationSignal = this.operationSignal(signal);
+      const intent = this.consumeIntent(token, "update");
+      const profile = this.sameProfile(intent.profile);
+      const candidate = intent.candidate;
+      const previousReceipt = intent.receipt;
+      const currentReceipt = this.receipts().find((receipt) => receipt.receiptId === previousReceipt.receiptId);
+      if (currentReceipt === void 0 || JSON.stringify(currentReceipt) !== JSON.stringify(previousReceipt)) {
+        throw new MarketInstallError("conflict", "The market install receipt changed before update.");
+      }
+      try {
+        await this.assertInstalled(profile, previousReceipt.packageName, previousReceipt.version, previousReceipt.bundlePatch, previousReceipt.integrity);
+        operationSignal.throwIfAborted();
+      } catch {
+        throw new MarketInstallError("conflict", "The installed plugin no longer matches its market receipt.");
+      }
+      if (this.candidates.get(candidate.key) !== candidate) {
+        throw new MarketInstallError("not-available", "The verified catalog item is no longer available.");
+      }
+      let verification;
+      try {
+        verification = await this.verifier.verify(candidate, operationSignal);
+      } catch (cause) {
+        operationSignal.throwIfAborted();
+        throw cause;
+      }
+      operationSignal.throwIfAborted();
+      if (verification.integrity !== intent.verification.integrity || verification.bundlePatch !== intent.verification.bundlePatch || verification.tarball !== intent.verification.tarball) {
+        throw new MarketInstallError("verification-failed", "The npm package changed after preview. Preview the update again.");
+      }
+      const receipt = {
+        ...previousReceipt,
+        version: candidate.version,
+        integrity: verification.integrity,
+        bundlePatch: verification.bundlePatch,
+        installedAt: new Date(this.now()).toISOString()
+      };
+      try {
+        await this.runUpdatePlugin(candidate, previousReceipt.version, previousReceipt.receiptId, profile, operationSignal);
+      } catch (cause) {
+        if (cause instanceof MarketInstallError && cause.code === "operation-failed") {
+          await this.pnpm.rollbackPluginUpdate(previousReceipt.receiptId);
+          throw new MarketInstallError("operation-failed", "The package manager failed during the update, so the previous version was restored.");
+        }
+        throw cause;
+      }
+      try {
+        await this.assertInstalled(profile, candidate.packageName, candidate.version, verification.bundlePatch, verification.integrity);
+        operationSignal.throwIfAborted();
+      } catch {
+        await this.pnpm.rollbackPluginUpdate(previousReceipt.receiptId);
+        throw new MarketInstallError("operation-failed", "The package manager finished, but the updated bundle was invalid, so the update was rolled back.");
+      }
+      try {
+        await this.saveReceipts(this.receipts().map((value) => value.receiptId === previousReceipt.receiptId ? receipt : value));
+      } catch {
+        await this.pnpm.rollbackPluginUpdate(previousReceipt.receiptId);
+        throw new MarketInstallError("persistence-failed", "The updated receipt could not be saved, so the update was rolled back.");
+      }
+      return { receipt };
     });
   }
   dispose() {
@@ -4798,6 +4980,7 @@ function asOperationPreview(value) {
   const request = value;
   if (request.action === "install" && exactKeys(request, ["action", "sourceRecordId", "itemId"]) && boundedIdentifier(request.sourceRecordId) && boundedIdentifier(request.itemId)) return { action: "install", sourceRecordId: request.sourceRecordId, itemId: request.itemId };
   if (request.action === "uninstall" && exactKeys(request, ["action", "receiptId"]) && boundedIdentifier(request.receiptId)) return { action: "uninstall", receiptId: request.receiptId };
+  if (request.action === "update" && exactKeys(request, ["action", "receiptId"]) && boundedIdentifier(request.receiptId)) return { action: "update", receiptId: request.receiptId };
   if ((request.action === "disable" || request.action === "enable") && exactKeys(request, ["action", "bundleId"]) && boundedIdentifier(request.bundleId)) return { action: request.action, bundleId: request.bundleId };
   throw new MarketInstallError("invalid-request", "Invalid package operation preview request.");
 }
@@ -4881,6 +5064,15 @@ function reconcileInstallations(receipts, value) {
       bundleId: bundle.bundleId,
       packageName: bundle.packageName
     }];
+  });
+}
+/** 把 checkUpdates 的更新命中按 receiptId 合并进已装列表（仅受管回执）。 */
+function mergeInstallationUpdates(installations, updates) {
+  const updatesByReceipt = /* @__PURE__ */ new Map();
+  for (const update of updates) updatesByReceipt.set(update.receiptId, update);
+  return installations.map((installation) => {
+    const update = installation.kind === "managed" ? updatesByReceipt.get(installation.receipt.receiptId) : void 0;
+    return update === void 0 ? installation : { ...installation, updateAvailable: true, latestVersion: update.latestVersion };
   });
 }
 function viewBuiltIns() {
@@ -5332,11 +5524,31 @@ function registerMarketRoutes(ctx, scope, installProvider, desktopActionsProvide
           sendJson(res, 503, { error: "market package operations are unavailable" });
           return;
         }
+        const controller = new AbortController();
+        const signal = AbortSignal.any([controller.signal, generationController.signal]);
+        const stopWatching = abortOnDisconnect(req, res, controller);
         try {
-          const installations = reconcileInstallations(await install.listVerifiedReceipts(), desktopPlugins.list());
-          if (!generationController.signal.aborted && !res.destroyed) sendJson(res, 200, { installations });
+          const installations = reconcileInstallations(await install.listVerifiedReceipts(signal), desktopPlugins.list());
+          // 更新可用性（#161）：checkUpdates 依赖 candidates 缓存，而该缓存只在目录
+          // 扫描或 installable 视图填充。这里主动复用一次扫描（5 分钟缓存兜底）补
+          // candidates，再把 updateAvailable/latestVersion 合并进已装列表，供 installed
+          // 视图渲染「更新」按钮。目录扫描失败不阻断已装列表本身（仍返回无更新信息）。
+          const updates = [];
+          try {
+            const index = await service.scanCatalog(signal, {});
+            if (index !== void 0) {
+              await install.listInstallable(index, signal);
+              updates.push(...await install.checkUpdates(signal));
+            }
+          } catch (cause) {
+            signal.throwIfAborted();
+          }
+          const merged = mergeInstallationUpdates(installations, updates);
+          if (!signal.aborted && !res.destroyed) sendJson(res, 200, { installations: merged });
         } catch (cause) {
-          if (!generationController.signal.aborted && !res.destroyed) sendInstallError(res, cause);
+          if (!signal.aborted && !res.destroyed) sendInstallError(res, cause);
+        } finally {
+          stopWatching();
         }
       } }),
       ctx.webServer.register({ kind: "exact", path: ROUTE_OPERATION_PREVIEW, handler: async (req, res) => {
@@ -5422,7 +5634,7 @@ function registerMarketRoutes(ctx, scope, installProvider, desktopActionsProvide
             if (install === void 0) {
               throw new MarketInstallError("not-available", "Market package operations are unavailable.");
             }
-            const preview = request.action === "install" ? await install.previewInstall(request.sourceRecordId, request.itemId, signal) : await install.previewUninstall(request.receiptId, signal);
+            const preview = request.action === "install" ? await install.previewInstall(request.sourceRecordId, request.itemId, signal) : request.action === "update" ? await install.previewUpdate(request.receiptId, signal) : await install.previewUninstall(request.receiptId, signal);
             const { intent, ...summary } = preview;
             if (!signal.aborted && !res.destroyed) sendJson(res, 200, { ...summary, previewId: intent });
           }
@@ -5645,6 +5857,17 @@ function apply(ctx) {
     }, "community-market: desktop package operations");
   });
 }
+// 纯函数面（仅测试消费；loader 只认 name/inject/apply，多余导出无副作用）。
+const __internals = {
+  MarketInstallService,
+  MarketInstallError,
+  createNpmRegistryVerifier,
+  stableExactVersion,
+  marketManagedPackage,
+  candidateKey2,
+  reconcileInstallations,
+  mergeInstallationUpdates
+};
 export {
   BUILT_IN_PROVIDERS,
   CatalogContractError,
@@ -5666,6 +5889,7 @@ export {
   parseCatalogSource,
   scopeCatalogCursor,
   serializeCatalogQuery,
-  validateLocalSourceRecords
+  validateLocalSourceRecords,
+  __internals
 };
 //# sourceMappingURL=index.js.map

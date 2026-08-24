@@ -216,6 +216,51 @@ pub(crate) fn parse_watcher_line(line: &str) -> Option<TurnEndLine> {
     })
 }
 
+/// 进行中的顶层 agent 回合数（supervisor 探活环「忙碌」判定源）。
+pub fn active_turns() -> u64 {
+    ACTIVE_TURNS.load(Ordering::Relaxed)
+}
+
+/// 回合活动（行协议对 ACTIVE_TURNS 的影响）。纯函数，供对抗测试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnActivity {
+    /// turn-start：进行中回合 +n。
+    Start(u64),
+    /// turn-end：进行中回合 -n（saturating，绝不落到负）。
+    End(u64),
+}
+
+/// 从 watcher 行提取回合活动。turn-start 恒 +count；turn-end **仅当带 count**
+/// 才 -count（count 缺省 = assistant/message 兜底通知，非真实 turn 结束，不得
+/// 误消进行中的真实回合）。畸形行 / 其他 type → None。
+pub fn parse_turn_activity(line: &str) -> Option<TurnActivity> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let count = |v: &serde_json::Value| v.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
+    match v.get("type")?.as_str()? {
+        "turn-start" => Some(TurnActivity::Start(count(&v).max(1))),
+        "turn-end" => {
+            // 缺 count（旧协议 / 兜底通知）→ 不减（0）。
+            Some(TurnActivity::End(count(&v)))
+        }
+        _ => None,
+    }
+}
+
+/// 应用一次回合活动到全局计数（saturating，跨会话并发安全）。
+pub fn apply_turn_activity(activity: TurnActivity) {
+    match activity {
+        TurnActivity::Start(n) => {
+            ACTIVE_TURNS.fetch_add(n, Ordering::Relaxed);
+        }
+        TurnActivity::End(n) if n > 0 => {
+            let _ = ACTIVE_TURNS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(n))
+            });
+        }
+        TurnActivity::End(_) => {}
+    }
+}
+
 /// capped 读行的结果。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LineOutcome {
@@ -286,6 +331,10 @@ static WATCHER_SLOT: Mutex<WatcherSlot> =
 static WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
 /// 退出中旗标（Electron `quitting`：退出中不再打扰；亦阻断崩溃重启）。
 static QUITTING: AtomicBool = AtomicBool::new(false);
+/// 进行中的顶层 agent 回合计数（turn-start +1 / turn-end -1，saturating）。
+/// supervisor 探活环据其判定「内核正在工作」——agent 长时间思考/压缩导致
+/// 内核事件循环被占、HTTP 无响应时不得误判假死强杀（issue #159）。
+static ACTIVE_TURNS: AtomicU64 = AtomicU64::new(0);
 /// 限流器（30s/会话 + 15s 全局）。Mutex<Option<_>> 仅为 static 常量初始化
 ///（HashMap::new 非 const）；首次使用时落座。
 static THROTTLE: Mutex<Option<NotifyThrottle>> = Mutex::new(None);
@@ -379,6 +428,10 @@ fn run_watcher(app: AppHandle, my_gen: u64, paths: WatcherPaths) {
             match spawn_watcher_process(&paths) {
                 Ok((mut child, streams)) => {
                     let SpawnedWatcher { stdout, stderr } = streams;
+                    // watcher (重)启动即重基线：上一代遗留的「进行中回合」计数作废
+                    // （新基线不再吐历史 turn/start/turn-end），否则滞留计数会让
+                    // 真死内核永远逃过假死重启兜底（issue #159）。
+                    ACTIVE_TURNS.store(0, Ordering::Relaxed);
                     // stdin 句柄留在槽内保活（drop 即管道断 → JS 自退）。
                     slot.stdin = child.stdin.take();
                     slot.owner_gen = my_gen;
@@ -424,6 +477,11 @@ fn run_watcher(app: AppHandle, my_gen: u64, paths: WatcherPaths) {
                 Ok(LineOutcome::Line(line)) => {
                     if is_retired(my_gen) {
                         break;
+                    }
+                    // 回合进行中计数（issue #159）：turn-start +1 / turn-end -1，
+                    // 供 supervisor 探活环判定「内核正在工作」时豁免假死强杀。
+                    if let Some(activity) = parse_turn_activity(&line) {
+                        apply_turn_activity(activity);
                     }
                     if let Some(ev) = parse_watcher_line(&line) {
                         // 逐事件 panic 隔离（同 lib.rs route_events 手法）。
@@ -860,6 +918,60 @@ mod line_protocol_tests {
             o => panic!("超大行后应恢复读行：{o:?}"),
         };
         assert!(parse_watcher_line(&line).is_some(), "恢复后的合法行可解析");
+    }
+}
+
+/// 回合活动计数（issue #159 内核「忙碌」判定源）：parse/apply 纯函数。
+#[cfg(test)]
+mod turn_activity_tests {
+    use super::*;
+
+    fn reset_active_turns() {
+        ACTIVE_TURNS.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn parse_turn_activity_shapes() {
+        assert_eq!(
+            parse_turn_activity(r#"{"type":"turn-start","sessionId":"s","count":2}"#),
+            Some(TurnActivity::Start(2))
+        );
+        assert_eq!(
+            parse_turn_activity(r#"{"type":"turn-start","sessionId":"s"}"#),
+            Some(TurnActivity::Start(1)),
+            "缺 count 的 turn-start 按 1 计"
+        );
+        assert_eq!(
+            parse_turn_activity(r#"{"type":"turn-end","sessionId":"s","count":1}"#),
+            Some(TurnActivity::End(1))
+        );
+        assert_eq!(
+            parse_turn_activity(r#"{"type":"turn-end","sessionId":"s"}"#),
+            Some(TurnActivity::End(0)),
+            "缺 count 的 turn-end 是兜底通知，不减"
+        );
+        assert_eq!(
+            parse_turn_activity(r#"{"type":"turn-end","sessionId":"s","title":"t","body":"b"}"#),
+            Some(TurnActivity::End(0))
+        );
+        for bad in ["", "not json", "{", r#"{"type":"ready"}"#, r#"{"type":"log"}"#] {
+            assert_eq!(parse_turn_activity(bad), None, "应拒收：{bad}");
+        }
+    }
+
+    #[test]
+    fn apply_turn_activity_balances_and_saturates() {
+        reset_active_turns();
+        apply_turn_activity(TurnActivity::Start(2));
+        assert_eq!(active_turns(), 2);
+        apply_turn_activity(TurnActivity::End(1));
+        assert_eq!(active_turns(), 1);
+        apply_turn_activity(TurnActivity::End(5));
+        assert_eq!(active_turns(), 0, "saturating 不到负");
+        apply_turn_activity(TurnActivity::Start(1));
+        apply_turn_activity(TurnActivity::End(0));
+        assert_eq!(active_turns(), 1, "End(0) 不减");
+        reset_active_turns();
     }
 }
 
