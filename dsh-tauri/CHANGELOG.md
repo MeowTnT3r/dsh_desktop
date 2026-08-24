@@ -1,5 +1,36 @@
 # Changelog — DSH Desktop（Tauri 版，主线架构 v0.5.0 起）
 
+## [0.5.5] — 2026-08-25
+
+### 修复（用户实测反馈驱动）
+- **文件以附件形式进对话（拖入/选中不再塞进输入框）**：`dsh-file-drop` 非图片文件从「读内容注入输入框」改为「附件 chip」（文件名+大小+×移除），发送时才物化——小文本（≤256KB 非二进制）内容随消息发送、大文件/二进制/桥层路径载荷给完整路径让 agent 读；`pendingBySession` 按会话隔离 + 包装 `inputActions.submit` 发送前物化（内核 setDraft 同步状态机，时序安全）+ 无槽位环境回退旧合并路径提示注入。图片仍走内核原生附件栏不受影响
+- **一键加载全部历史（K24）**：`Session.loadAllHistory()/cancelLoadAllHistory()` 分批自动加载完整个历史（每批 400、批间让帧、10000 保护上限、可取消、按 seq 去重）+ UI「加载全部历史」按钮/进度「已加载 N 条」/上限提示
+- **session 分组手动排序失效（K25）**：React 18 批处理下 `drag.active` 旧帧早退 → `onDragOver/onDrop` 未 preventDefault → 拖拽无效；`onDragStart` 注入 `flushSync` 同步提交 drag 状态（只改会话行、不动排序/持久化）
+- **思考中页面被历史折叠拉回底端（K22）**：`session-event-bound` 增加 running 门控——流式期间暂停 trim（不滚动到底端打断阅读）
+- **打开小窗白屏+卡死（K23）**：`open_float_window/open_pet_window` 的 `build()+show()` 移入独立线程，根治 WebviewWindowBuilder 死锁
+- **历史加载三问题根治（K8/K14）**：loadOlder 竞态/重置/运行中不加载——`session-event-bound` v4（loadOlder 请求期间暂停 trim + baseSeq 不动 + trimSuppressedFloor 动态上限 + 按 seq 去重，顺带根治 tool-call 重复边界事件）+ dsh-mini `readAllLogEvents` 全量重读改增量读（mtime+size+帧索引缓存）
+- **内核假死误杀 #159（K18）**：`probe_loop` 假死判定加 agent 回合感知——`session_notify` ACTIVE_TURNS 计数 + `should_restart_zombie(zombie, active_turns)=zombie>=20 && active_turns==0`（有回合豁免 + ZOMBIE_DEFER_MAX 兜底，真死内核仍能杀）
+- **closeToTray 假开关 #160（K19）**：CloseRequested 读 `closeToTray` 设置（默认 true 关到托盘、显式 false 放行真退出），不再无条件 prevent_close+hide
+- **市场插件无法更新 #161（K20+K21）**：新市场迁移丢失更新链路——桥补 updatePlugin/rollbackPluginUpdate + 宿主补 checkUpdates/previewUpdate/executeUpdate（含回滚）+ 客户端「更新」按钮/确认弹窗/错误映射，installations 路由合并 updateAvailable
+- **点外链白屏/没反应（K15，#149/#162）**：`bridge-shim.js` 全局点击委托拦截 `target=_blank` http(s) 外链 → `openExternal` 系统浏览器，余额 dock 点击跳官网
+- **空工具名 unknown tool ""（K11）**：`empty-tool-name` 防御补丁，空工具名给带指引报错（适配器协议/中转网关/模型输出）替代裸 unknown tool ""
+- **文件改动无 diff 记录（K26）**：dsh-client-file-changes 3-way diff（diffRows/diffStats/diffKindClass）+ ChangeRecord 历史 + 三色高亮（add/mod/del）
+- **diff 高亮看不到（K28）**：diff 高亮内嵌侧边栏文件预览——window store 单例 + CodeMirror 行装饰（绿 add / 黄 mod / 红 del 计数），与其他 agent 观感一致
+- **命令全英文（K27）**：skill 命令汉化（工具名机器 key 逐字不变）
+
+### 新增
+- **dsh-basics-panel 内置（K10）**：MCP/skills/rules 面板 + 空态「新建」按钮定制
+- **better-sidebar v0.15.2（K13）**：上游新功能（侧边对话/文件树/上传/mermaid）+ 移植保留 F1/H4/W2 修复
+- **自动更新置顶进度窗（K12）**：下载进度条 + 百分比，独立事件名不干扰菜单
+- **文件附件 chip**：拖入/选中文件小内容+大路径，发送时物化
+
+### 工程
+- 补丁计数对账：spec 53→54（`manual-sort-drag-fix`）+ `WORKSPACE_PKG_REL` 收口（`workspace-search-rail-fix` 移出内联白名单）+ order 撞序修复
+- 门禁：cargo FAILURES:0；node 全套 1665 pass / 0 fail；file-drop 52/52、syntax-scan 46/46
+
+### 已知限制（内核上游，本期不改）
+- **自定义多模态模型读不到图片**：内核 `dsh-llm-pi-ai` 对未显式声明 `input` 的自定义模型回落 `DEFAULT_INPUT=["text"]`。绕法：`settings.yaml` 的 `llm-pi-ai` 给模型手动加 `input: [text, image]`。已反馈上游。
+
 ## [0.5.4] — 2026-08-23
 
 ### 修复（用户实测反馈驱动）
