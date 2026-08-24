@@ -1446,8 +1446,11 @@ jobs:
               --data-urlencode "prerelease=${PRE}" \
               --data-urlencode "target_commitish=${TAG}" > gitee-rel.json
           }
-          if [ "$http" = "200" ]; then
-            REL_ID=$(jq -r '.id' gitee-rel.json)
+          # Gitee 对不存在的 release 返回 200 + 空(null) 而非 404（实测），
+          # 以响应体能否取到 .id 判定存在性，勿只依赖 HTTP 状态码。
+          EXISTS_ID=$(jq -r 'if type == "object" then (.id // empty) else empty end' gitee-rel.json 2>/dev/null || true)
+          if [ "$http" = "200" ] && [ -n "$EXISTS_ID" ]; then
+            REL_ID="$EXISTS_ID"
             echo "Gitee release ${TAG} 已存在（id=${REL_ID}）——核对资产漂移"
             drift=0
             while IFS=$'\t' read -r name size; do
@@ -1462,8 +1465,8 @@ jobs:
               curl -sf -X DELETE "${GITEE_API}/repos/${GITEE_REPO}/releases/${REL_ID}?access_token=${GITEE_TOKEN}"
               create_release
             fi
-          elif [ "$http" = "404" ]; then
-            echo "Gitee release ${TAG} 不存在——按 GitHub 元数据创建"
+          elif [ "$http" = "200" ] || [ "$http" = "404" ]; then
+            echo "Gitee release ${TAG} 不存在（http=${http}）——按 GitHub 元数据创建"
             create_release
           else
             echo "::error::查询 Gitee release 失败 http=${http}"; cat gitee-rel.json; exit 1
