@@ -265,6 +265,11 @@ pub fn run() {
         .run(|app, event| {
             match event {
                 tauri::RunEvent::ExitRequested { .. } => {
+                    // 问题 2：退出前保存主窗状态——用户调整尺寸/位置后直接走
+                    // 托盘「退出」/ Cmd+Q 时不再丢。窗口可能已销毁（closeToTray
+                    // =false 关窗即退），save_main_window_state 内部 if let 容错，
+                    // 读不到就跳过，绝不 panic。
+                    windows::save_main_window_state(app);
                     if let Some(state) = app.try_state::<AppState>() {
                         if let Some(sv) = state.supervisor.lock().unwrap_or_else(|p| p.into_inner()).clone() {
                             sv.shutdown();
@@ -276,6 +281,7 @@ pub fn run() {
                 tauri::RunEvent::Exit => {
                     // std::process::exit 不跑 Drop：锁与内核树在此显式收尾
                     //（Review#2：exit(0) 后锁残留实测）。
+                    windows::save_main_window_state(app);
                     if let Some(state) = app.try_state::<AppState>() {
                         if let Some(sv) = state.supervisor.lock().unwrap_or_else(|p| p.into_inner()).clone() {
                             sv.shutdown();
@@ -286,6 +292,20 @@ pub fn run() {
                     session_notify::shutdown_watcher();
                     if let Some(mut g) = INSTANCE_LOCK.lock().unwrap_or_else(|p| p.into_inner()).take() {
                         g.release();
+                    }
+                }
+                // macOS 点 Dock 图标重开（Reopen = NSApplicationDelegate 的
+                // applicationShouldHandleReopen）：关窗到托盘时主窗只是 hide
+                // （进程常驻、内核继续跑），无可见窗口时点 Dock 会派发 Reopen——
+                // 此前无此分支，隐藏主窗无法被唤回，只能重启 app。三件套与托盘
+                // show_main 同口径（show 能唤回 closeToTray 藏起的窗口）；拿不到
+                // 主窗（异常态）静默跳过，不 panic。
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
                     }
                 }
                 _ => {}

@@ -28,6 +28,43 @@ fn sanitize_label(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(64).collect()
 }
 
+/// 工作区逻辑尺寸 → 首次打开默认几何（纯计算，可单测）：
+/// 90% 宽/高，clamp 到 [min 980×600, 舒适上限 1280×820]，并居中于工作区。
+/// 小屏（< min）会顶到 min 下限（与 min_inner_size 同口径，绝不小于最小窗）。
+fn compute_default_geometry(work_w: f64, work_h: f64, work_x: f64, work_y: f64) -> (f64, f64, f64, f64) {
+    const DEFAULT_W: f64 = 1280.0;
+    const DEFAULT_H: f64 = 820.0;
+    const MIN_W: f64 = 980.0;
+    const MIN_H: f64 = 600.0;
+    const RATIO: f64 = 0.9;
+    let w = (work_w * RATIO).clamp(MIN_W, DEFAULT_W);
+    let h = (work_h * RATIO).clamp(MIN_H, DEFAULT_H);
+    let x = work_x + (work_w - w) / 2.0;
+    let y = work_y + (work_h - h) / 2.0;
+    (w, h, x, y)
+}
+
+/// 首次打开（无已存状态）默认尺寸：相对主显示器**工作区**取合理比例，
+/// 拿不到 monitor / scale_factor 非法 → 回退 1280×820（系统默认居中），
+/// 绝不 panic。返回 (w, h, Some((x, y))) 逻辑像素（inner_size/position 同口径）。
+fn default_main_window_geometry(app: &tauri::AppHandle) -> (f64, f64, Option<(f64, f64)>) {
+    let Some(mon) = app.primary_monitor().ok().flatten() else {
+        return (1280.0, 820.0, None);
+    };
+    let scale = mon.scale_factor();
+    if scale <= 0.0 {
+        return (1280.0, 820.0, None);
+    }
+    // work_area 是物理像素，除 scale_factor 转逻辑像素（inner_size/position 口径）。
+    let wa = mon.work_area();
+    let work_w = wa.size.width as f64 / scale;
+    let work_h = wa.size.height as f64 / scale;
+    let work_x = wa.position.x as f64 / scale;
+    let work_y = wa.position.y as f64 / scale;
+    let (w, h, x, y) = compute_default_geometry(work_w, work_h, work_x, work_y);
+    (w, h, Some((x, y)))
+}
+
 /// 主窗：decorations:false + 导航围栏 + 垫片。初始加载 loading 页。
 #[allow(clippy::too_many_arguments)]
 pub fn create_main_window(
@@ -65,7 +102,13 @@ pub fn create_main_window(
             b = b.maximized(true);
         }
     } else {
-        b = b.inner_size(1280.0, 820.0);
+        // 首次打开（无已存状态）：按当前显示器工作区取 90% 比例并居中，
+        // 拿不到 monitor 回退 1280×820（系统默认居中），绝不 panic。
+        let (w, h, pos) = default_main_window_geometry(app);
+        b = b.inner_size(w, h);
+        if let Some((x, y)) = pos {
+            b = b.position(x, y);
+        }
     }
     let win = b.build()?;
     let handle = app.clone();
@@ -125,6 +168,20 @@ pub fn create_main_window(
     Ok(win)
 }
 
+/// 读主窗当前 outer_position + inner_size + is_maximized 并存到
+/// window-state.json。隐藏到托盘（hide_main_to_tray）与真退出
+/// （RunEvent::ExitRequested/Exit）两条路径共用——用户调整过窗口尺寸/位置后，
+/// 无论走「关窗→托盘→退出」还是「托盘退出 / Cmd+Q」都能记住。任何读取失败
+/// （窗口已销毁 / 异常退出）都 if let 静默跳过，绝不 panic。
+pub fn save_main_window_state(app: &tauri::AppHandle) {
+    if let (Some(w), Some(state)) = (app.get_webview_window("main"), app.try_state::<crate::AppState>()) {
+        if let (Ok(pos), Ok(size)) = (w.outer_position(), w.inner_size()) {
+            let maxed = w.is_maximized().unwrap_or(false);
+            let _ = crate::save_window_state(&state, (pos.x, pos.y, size.width as f64, size.height as f64, maxed));
+        }
+    }
+}
+
 /// 关窗→托盘（0.5.0）：保存窗口状态后隐藏主窗。进程与内核继续运行，
 /// 经托盘「显示主窗口」/ 双击图标（第二实例聚焦）唤回。
 /// 唯一真退出入口 = 托盘「退出」（supervisor.shutdown + exit，Job Object 杀树）。
@@ -132,12 +189,7 @@ pub fn hide_main_to_tray(win: &tauri::WebviewWindow) {
     let app = win.app_handle();
     // 隐藏前保存窗口状态（settings.json windowState）——此后可能经强杀路径
     // 退出，CloseRequested 不再有触发机会。
-    if let (Some(w), Some(state)) = (app.get_webview_window("main"), app.try_state::<crate::AppState>()) {
-        if let (Ok(pos), Ok(size)) = (w.outer_position(), w.inner_size()) {
-            let maxed = w.is_maximized().unwrap_or(false);
-            let _ = crate::save_window_state(&state, (pos.x, pos.y, size.width as f64, size.height as f64, maxed));
-        }
-    }
+    save_main_window_state(&app);
     let _ = win.hide();
 }
 
@@ -849,6 +901,27 @@ pub fn update_progress_inject_script(version: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 问题 1：首次打开默认几何——90% 工作区、clamp 到 [980×600, 1280×820]、
+    /// 居中于工作区（左上角 + 剩余/2）。纯计算决策表。
+    #[test]
+    fn default_geometry_clamps_and_centers() {
+        // 大屏（1920×1080 逻辑，无任务栏）→ 顶到舒适上限 1280×820，居中。
+        assert_eq!(compute_default_geometry(1920.0, 1080.0, 0.0, 0.0), (1280.0, 820.0, 320.0, 130.0));
+        // 笔记本 1366×768（任务栏占高，工作区 1366×728）→ 90% 且不超上限。
+        let (w, h, x, y) = compute_default_geometry(1366.0, 728.0, 0.0, 0.0);
+        assert!((w - 1229.4).abs() < 1e-9, "w={w}");
+        assert!((h - 655.2).abs() < 1e-9, "h={h}");
+        assert!((x - (1366.0 - w) / 2.0).abs() < 1e-9, "x={x}");
+        assert!((y - (728.0 - h) / 2.0).abs() < 1e-9, "y={y}");
+        // 小屏 1024×640 → 宽顶到 min 980、高顶到 min 600（与 min_inner_size 同口径）。
+        let (w, h, x, y) = compute_default_geometry(1024.0, 640.0, 0.0, 0.0);
+        assert_eq!((w, h), (980.0, 600.0));
+        assert!((x - (1024.0 - 980.0) / 2.0).abs() < 1e-9 && (y - (640.0 - 600.0) / 2.0).abs() < 1e-9);
+        // 工作区左上角偏移（副屏坐标非 0,0）→ 居中基准随工作区平移。
+        let (_, _, x2, y2) = compute_default_geometry(1920.0, 1080.0, 2000.0, 100.0);
+        assert_eq!((x2, y2), (2000.0 + 320.0, 100.0 + 130.0));
+    }
+
     #[test]
     fn float_label_sanitizes_hostile_input() {
         assert_eq!(float_label("abc123"), "float-abc123");
@@ -1119,7 +1192,7 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("// 浮窗").next())
             .expect("hide_main_to_tray 函数体");
-        let save_pos = seg.find("save_window_state").expect("必须保存窗口状态");
+        let save_pos = seg.find("save_main_window_state").expect("必须保存窗口状态");
         let hide_pos = seg.find("win.hide()").expect("必须隐藏窗口");
         assert!(save_pos < hide_pos, "先存状态后隐藏（强杀路径兜底）: {seg}");
     }
