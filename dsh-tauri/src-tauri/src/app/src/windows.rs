@@ -66,6 +66,9 @@ fn default_main_window_geometry(app: &tauri::AppHandle) -> (f64, f64, Option<(f6
 }
 
 /// 主窗：decorations:false + 导航围栏 + 垫片。初始加载 loading 页。
+///
+/// Linux 例外：WebKitGTK 下 undecorated 窗口存在首帧不渲染/白屏的已知问题
+/// （tauri/wry），故 Linux 退回原生标题栏；Windows/macOS 维持自绘标题栏。
 #[allow(clippy::too_many_arguments)]
 pub fn create_main_window(
     app: &tauri::AppHandle,
@@ -85,7 +88,9 @@ pub fn create_main_window(
     )
     .title("DSH Desktop")
     .min_inner_size(980.0, 600.0)
-    .decorations(false)
+    // Linux/WebKitGTK：undecorated 窗口首帧不渲染/白屏（tauri/wry 已知问题），
+    // 退回原生标题栏；Windows/macOS 维持自绘标题栏（decorations:false）。
+    .decorations(cfg!(target_os = "linux"))
     // 显式声明（用户实测「不能调整窗口大小」）：undecorated 窗口默认应可
     // 拖边缩放，显式置 true 防构建配置漂移；与 Electron frame:false +
     // resizable:true 行为对齐。
@@ -1031,6 +1036,27 @@ mod tests {
         assert!(seg.contains("pet_auto_open_from_store"), "必须经 pet_auto_open_from_store 读键: {seg}");
         assert!(seg.contains("should_open_pet_on_minimize"), "必须走纯判定门: {seg}");
         assert!(seg.contains("open_pet_window"), "判定为真必须打开宠物窗: {seg}");
+    }
+
+    /// Linux/WebKitGTK 白屏兜底：主窗 decorations 必须平台门控——Linux 退回
+    /// 原生标题栏（undecorated 首帧不渲染是 tauri/wry 已知问题），
+    /// Windows/macOS 维持自绘标题栏（decorations:false）。
+    #[test]
+    fn main_window_decorations_platform_gated_shape() {
+        let src = include_str!("windows.rs");
+        let seg = src
+            .split("pub fn create_main_window")
+            .nth(1)
+            .and_then(|s| s.split("pub fn hide_main_to_tray").next())
+            .expect("create_main_window 函数体");
+        assert!(
+            seg.contains(".decorations(cfg!(target_os = \"linux\"))"),
+            "主窗 decorations 必须平台门控（Linux 原生标题栏防白屏，Win/mac 自绘）: {seg}"
+        );
+        assert!(
+            !seg.contains(".decorations(false)"),
+            "主窗不得硬编码 decorations(false)（Linux 白屏回归面）: {seg}"
+        );
     }
 
     /// G3：非主窗 minimize 不触发自动弹宠物窗——自动弹窗只接在主窗
