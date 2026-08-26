@@ -75,6 +75,9 @@ const COMPANION_PLUGINS = [
   // —— 效率插件包（借鉴 EAC 移植，纯客户端） ——
   // 拖入文件到对话：拖入文本/代码注入内容，图片/二进制注入路径提示。
   { id: 'file-drop', name: 'dsh-file-drop' },
+  // 终端式上下键命令历史回溯：↑ 回溯上一条已发送用户消息、↓ 往前翻回较新，
+  // 空草稿才触发、越界回到空、编辑即复位、按会话隔离。
+  { id: 'input-history', name: 'dsh-input-history' },
   // 图片粘贴发送：Ctrl/Cmd+V 粘贴图片存临时目录后注入路径提示。
   { id: 'image-paste', name: 'dsh-image-paste' },
   // 对话回退：消息 hover 出「编辑并回退」，按上一回合分叉新会话重发。
