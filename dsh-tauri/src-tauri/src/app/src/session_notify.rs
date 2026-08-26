@@ -27,6 +27,9 @@
 //!      被门拦截的 turn-end 不消耗限流额度（Electron 同序）
 //!   5. tauri-plugin-notification 弹通知（title||'DSH 任务完成' /
 //!      body||'会话任务已完成'；正文由 watcher 按 Electron emit 组装）
+//!      + 主窗未聚焦时请求任务栏注意力（request_user_attention → Windows
+//!        任务栏 DSH 图标闪烁）；与通知同一门控（开关 + 未聚焦 + 限流），
+//!        不额外制造骚扰。
 //! 点击跳转：主窗 Focused(true) → on_main_window_focused → emit
 //!   "notification-jump" {"sessionId"} —— bridge-shim.js:78 已监听该事件名
 //!   （垫片 onNotificationJump → dsh-session-manager 跳转；订阅前到达的跳转
@@ -608,8 +611,12 @@ fn handle_turn_end(app: &AppHandle, ev: &TurnEndLine) {
             .unwrap_or_else(|p| p.into_inner())
             .get_or_insert_with(NotifyThrottle::new)
             .decide(&ev.event.session_id, now_ms());
-    // 5. 总裁决 + 弹通知。
+    // 5. 总裁决 + 弹通知 + 请求任务栏注意力（同一门控：未聚焦才闪）。
     if should_notify(enabled, focused, is_current, throttle_ok) {
+        // 主窗未聚焦（should_notify 已含 !focused）→ 让任务栏 DSH 图标闪烁，
+        // 提醒用户回来看结果；与通知同受 notifyOnTurnEnd 开关 + 限流约束，
+        // 不额外制造骚扰。
+        request_main_window_attention(app);
         fire_notification(app, ev);
     }
 }
@@ -643,6 +650,18 @@ fn notify_gates(app: &AppHandle, session_id: &str) -> (bool, bool, bool) {
     });
     let is_current = focused && current.as_deref() == Some(session_id);
     (enabled, focused, is_current)
+}
+
+/// 请求主窗任务栏注意力（Windows：任务栏 DSH 图标闪烁，提醒用户回来看）。
+/// 拿不到主窗 / 平台不支持 / 请求失败 → 静默（不 panic、不影响主流程）。
+///
+/// AttentionType 选 `Informational`：Windows 上仅闪烁任务栏按钮直至应用重新
+/// 聚焦（不闪窗口标题栏，避免过度打扰）；`Critical` 会额外闪烁窗口本身，
+/// 「回来看结果」用 Informational 足够（tauri 2.11 `UserAttentionType`）。
+fn request_main_window_attention(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
 }
 
 fn fire_notification(app: &AppHandle, ev: &TurnEndLine) {
@@ -1055,6 +1074,37 @@ mod shape_tests {
             doc.contains("C2") && doc.contains("turn-end"),
             "trigger_fetch 文档必须标注 C2 挂点与 turn-end 消费方"
         );
+    }
+
+    /// 任务栏闪烁接入形态：handle_turn_end 总裁决分支内、限流之后、与通知
+    /// 发射同分支请求主窗注意力（should_notify 已含 !focused → 未聚焦才闪）；
+    /// 封装函数拿主窗 + Informational（Windows 任务栏图标闪烁）+ 失败静默。
+    #[test]
+    fn taskbar_attention_wiring_shape() {
+        let src = include_str!("session_notify.rs").replace("\r\n", "\n");
+
+        // 封装函数形态（位于 notify_gates 之后 / fire_notification 之前）。
+        let helper = src
+            .split("fn request_main_window_attention")
+            .nth(1)
+            .and_then(|s| s.split("fn fire_notification").next())
+            .expect("request_main_window_attention 函数体");
+        assert!(helper.contains("get_webview_window(\"main\")"), "必须拿主窗");
+        assert!(helper.contains("request_user_attention"), "必须调用 request_user_attention");
+        assert!(helper.contains("UserAttentionType::Informational"), "Informational（任务栏图标闪烁）");
+        assert!(helper.contains("let _ ="), "失败静默不 panic");
+
+        // handle_turn_end：注意力请求在限流之后、通知发射之前（同一总裁决分支）。
+        let seg = src
+            .split("fn handle_turn_end")
+            .nth(1)
+            .and_then(|s| s.split("fn notify_gates").next())
+            .expect("handle_turn_end 函数体");
+        let throttle = seg.find(".decide(").expect("限流");
+        let att = seg.find("request_main_window_attention").expect("注意力请求");
+        let fire = seg.find("fire_notification").expect("通知发射");
+        assert!(throttle < att, "注意力请求必须在限流之后（同一门控）");
+        assert!(att < fire, "注意力请求先于通知发射（同分支）");
     }
 
     /// watcher 子进程 spawn 形态：抑制终端窗 + 行协议参数 + payload 脚本名。
