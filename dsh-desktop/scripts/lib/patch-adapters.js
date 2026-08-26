@@ -61,6 +61,9 @@ const { patchPiAiCredits } = require('../patch-pi-ai-credits');
 // 供应商模型条目无 reasoningEfforts 字典时 pi-ai 回落 reasoning:false，控件
 // 永不出现；手声明条目回落标准 OpenAI 档位字典，开箱即用且未选档位不发字段）。
 const { patchPiAiReasoningDefaults } = require('../patch-pi-ai-reasoning-defaults');
+// pi-ai 上下文超限友好文案补丁（第三方 OpenAI 兼容端点裸 400/413 无响应体
+// → 上下文超限提示，避免「400 status code (no body)」死谜语）。
+const { patchPiAiOverflowMessage } = require('../patch-pi-ai-overflow-message');
 // 设置写入韧性（PR5：v0.5.2「添加供应商没反应/灰」两层根治——孤儿锁自愈 +
 // 设置页命名空间自愈 + settings-conflict 静默重试）。
 const {
@@ -1964,6 +1967,7 @@ module.exports = {
     patchPiAiOpencodeGoModels,
     patchPiAiCredits,
     patchPiAiReasoningDefaults,
+    patchPiAiOverflowMessage,
     patchAtomicWriteOrphanLock,
     patchSettingsModelsResilience,
     patchBundleArrivalRetry,

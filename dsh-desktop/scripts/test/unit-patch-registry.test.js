@@ -91,7 +91,7 @@ test('防护类补丁与包级补丁均已登记（无遗漏 apply*）', () => {
     'settings-section-guard', 'workspace-search-rail-fix', 'plugin-inventory-tab-merge',
     'web-search-baseurl', 'menu-viewport', 'session-manage', 'open-project-dir',
     'session-persistence', 'tool-source-compat', 'pi-ai-opencode-go-models',
-    'pi-ai-credits', 'pi-ai-reasoning-defaults',
+    'pi-ai-credits', 'pi-ai-reasoning-defaults', 'pi-ai-overflow-message',
     'atomic-write-orphan-lock', 'settings-models-resilience',
     'bundle-arrival-retry', 'agent-loop-scheduler-guard',
     'empty-tool-name-guidance',
@@ -99,15 +99,15 @@ test('防护类补丁与包级补丁均已登记（无遗漏 apply*）', () => {
   for (const id of expected) assert.ok(ids.has(id), `遗漏补丁 ${id}`);
 });
 
-test('getSpecsByCli：返回 19 个 cli:true 补丁（8 runtime + 5 数据完整性 + 2 设置写入韧性 + 3 内核韧性）', () => {
+test('getSpecsByCli：返回 20 个 cli:true 补丁（8 runtime + 5 数据完整性 + 2 设置写入韧性 + 3 内核韧性 + 1 pi-ai 超限文案）', () => {
   const specs = getSpecsByCli();
-  assert.equal(specs.length, 19, 'cli 清单应恰为 19 项');
+  assert.equal(specs.length, 20, 'cli 清单应恰为 20 项');
   const expected = new Set([
     'slot-legacy-key', 'slot-unkeyed-compat', 'slot-error-isolation',
     'runtime-flash-fix', 'session-event-bound', 'prompt-expose-fix', 'shell-description-compat',
     'code-mode-compat', 'attachment-mime-trust', 'session-persistence',
     'tool-source-compat', 'pi-ai-opencode-go-models', 'pi-ai-credits',
-    'pi-ai-reasoning-defaults',
+    'pi-ai-reasoning-defaults', 'pi-ai-overflow-message',
     'atomic-write-orphan-lock', 'settings-models-resilience',
     'bundle-arrival-retry', 'agent-loop-scheduler-guard',
     'empty-tool-name-guidance',
@@ -149,6 +149,7 @@ test('getSpecsByCli：每个 spec 的 transform/apply 与 patch-adapters 导出�
     'pi-ai-opencode-go-models': adapters.rootAppliers.patchPiAiOpencodeGoModels,
     'pi-ai-credits': adapters.rootAppliers.patchPiAiCredits,
     'pi-ai-reasoning-defaults': adapters.rootAppliers.patchPiAiReasoningDefaults,
+    'pi-ai-overflow-message': adapters.rootAppliers.patchPiAiOverflowMessage,
     'atomic-write-orphan-lock': adapters.rootAppliers.patchAtomicWriteOrphanLock,
     'settings-models-resilience': adapters.rootAppliers.patchSettingsModelsResilience,
     'bundle-arrival-retry': adapters.rootAppliers.patchBundleArrivalRetry,

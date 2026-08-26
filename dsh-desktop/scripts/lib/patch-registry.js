@@ -1091,6 +1091,30 @@ const PATCH_SPECS = [
     failLog: (root, err) => 'pi-ai 余额判定补丁失败(' + root + '): ' + err.message,
   },
   // -------------------------------------------------------------------------
+  // pi-ai 上下文超限友好文案补丁（第三方模型接入）：OpenAI 兼容端点超窗常见
+  // 「HTTP 400 无响应体」，OpenAI SDK 格式化为 "400 status code (no body)"。
+  // mapStopReason 已把它分类为 CONTEXT_WINDOW_EXCEEDED（code 正确），但
+  // failure.message 仍是原样 errorMessage，客户端 displayFailureMessage 只对
+  // AUTH 改写文案 → 用户看到死谜语。补丁在 overflow 分支把裸 400/413 no body
+  // 映射为可操作提示（精简/开新会话），其余可读超限文案不丢信息。锚点失配
+  // 自动退役。见 scripts/patch-pi-ai-overflow-message.js。
+  // -------------------------------------------------------------------------
+  {
+    id: 'pi-ai-overflow-message',
+    group: 'package',
+    order: 232,
+    kind: 'root',
+    layout: 'nm-roots',
+    wslLayout: 'nm-roots',
+    apply: rootAppliers.patchPiAiOverflowMessage,
+    marker: null,
+    requires: [],
+    failPolicy: 'warn',
+    cli: true,
+    successLog: (root) => 'pi-ai 超限文案补丁: 已应用到 ' + root,
+    failLog: (root, err) => 'pi-ai 超限文案补丁失败(' + root + '): ' + err.message,
+  },
+  // -------------------------------------------------------------------------
   // 设置写入韧性补丁（PR5，v0.5.2「添加供应商没反应/灰」两层根治）：
   //   1) 孤儿锁自愈（dsh-atomic-write）——内核持锁窗口内被强杀留下
   //      settings.yaml.lock 孤儿，此后该机所有设置写入 2s 超时失败（页面只读
