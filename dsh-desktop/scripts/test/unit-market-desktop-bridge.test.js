@@ -98,6 +98,19 @@ test('A4 CRLF 保真', () => {
   assert.ok(!/(?<!\r)\n/.test(disabled), '不产生混合换行');
 });
 
+test('A5 buildPluginArgv 携带必需的 --profile（issue #164）', () => {
+  const entry = { file: 'node.exe', args: ['--use-system-ca', 'C:/dsh/lib/bin.js'], cwd: 'C:/dsh/lib', viaShell: false };
+  assert.deepStrictEqual(
+    internals.buildPluginArgv(entry, ['add', 'x@1.0.0', '--save-exact'], 'web'),
+    ['--use-system-ca', 'C:/dsh/lib/bin.js', 'plugin', '--profile', 'web', 'add', 'x@1.0.0', '--save-exact'],
+  );
+  // 缺 profile 时也不崩（仅不插入 --profile，交由内核 CLI 报必需项缺失）
+  assert.deepStrictEqual(
+    internals.buildPluginArgv(entry, ['remove', 'x'], undefined),
+    ['--use-system-ca', 'C:/dsh/lib/bin.js', 'plugin', 'remove', 'x'],
+  );
+});
+
 test('B1 包元数据满足 hub 登记规则（name/精确 semver/description/private）', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(bridgeDir, 'package.json'), 'utf8'));
   assert.strictEqual(pkg.name, 'dsh-market-desktop-bridge');

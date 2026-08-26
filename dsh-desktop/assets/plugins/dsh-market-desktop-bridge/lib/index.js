@@ -120,10 +120,22 @@ function killChildTree(child) {
  * @param {readonly string[]} pluginArgs plugin 子命令参数（如 ['add','x@1.0.0']）
  * @param {string} invokingDir 命令 cwd（profile 目录）
  * @param {AbortSignal} [signal]
+ * @param {string} [profile] profile 名（`dsh plugin` 的 `--profile` 为必需项，
+ *   缺省时内核 CLI 直接 `required option '--profile <name>' not specified` 报错，
+ *   导致市场安装/更新/卸载全部失败 —— issue #164）。
  */
-function runDshPlugin(pluginArgs, invokingDir, signal) {
+/** 组装 `dsh plugin …` 的完整 argv（含必需的 `--profile <name>`）。 */
+function buildPluginArgv(entry, pluginArgs, profile) {
+  const argv = [...entry.args, 'plugin'];
+  if (typeof profile === 'string' && profile !== '') argv.push('--profile', profile);
+  argv.push(...pluginArgs);
+  return argv;
+}
+
+function runDshPlugin(pluginArgs, invokingDir, signal, profile) {
   const entry = dshArgv();
-  const child = spawnShim(entry.file, [...entry.args, 'plugin', ...pluginArgs], {
+  const argv = buildPluginArgv(entry, pluginArgs, profile);
+  const child = spawnShim(entry.file, argv, {
     cwd: invokingDir || entry.cwd || undefined,
     env: spawnEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -434,13 +446,13 @@ class BridgePnpmService extends Service {
     this._updateReceipts = new Map();
   }
   runPlugin(args, invokingDir, signal) {
-    return runDshPlugin(args, invokingDir ?? this._profile.dir, signal);
+    return runDshPlugin(args, invokingDir ?? this._profile.dir, signal, this._profile.name);
   }
   async installPlugin(request) {
     const { pnpmOptions = [], invokingDir, recovery, signal } = request;
     const target = `${recovery.packageName}@${recovery.packageVersion}`;
     this._receiptPackages.set(recovery.receiptId, recovery.packageName);
-    return runDshPlugin(['add', target, '--save-exact', ...pnpmOptions], invokingDir ?? this._profile.dir, signal);
+    return runDshPlugin(['add', target, '--save-exact', ...pnpmOptions], invokingDir ?? this._profile.dir, signal, this._profile.name);
   }
   async recoveredInstallReceiptIds() { return []; }
   async acknowledgeRecoveredInstall() { /* 无 WAL：无恢复面 */ }
@@ -448,7 +460,7 @@ class BridgePnpmService extends Service {
     const packageName = this._receiptPackages.get(receiptId);
     if (packageName === undefined) return false;
     this._receiptPackages.delete(receiptId);
-    const handle = runDshPlugin(['remove', packageName], this._profile.dir, undefined);
+    const handle = runDshPlugin(['remove', packageName], this._profile.dir, undefined, this._profile.name);
     const outcome = await handle.done;
     return outcome.exitCode === 0;
   }
@@ -460,13 +472,13 @@ class BridgePnpmService extends Service {
   async updatePlugin(request) {
     const { pnpmOptions = [], packageName, packageVersion, previousVersion, invokingDir, receiptId, signal } = request;
     this._updateReceipts.set(receiptId, { packageName, previousVersion });
-    return runDshPlugin(updateAddCommand(packageName, packageVersion, pnpmOptions), invokingDir ?? this._profile.dir, signal);
+    return runDshPlugin(updateAddCommand(packageName, packageVersion, pnpmOptions), invokingDir ?? this._profile.dir, signal, this._profile.name);
   }
   async rollbackPluginUpdate(receiptId) {
     const record = this._updateReceipts.get(receiptId);
     if (record === undefined) return false;
     this._updateReceipts.delete(receiptId);
-    const handle = runDshPlugin(updateAddCommand(record.packageName, record.previousVersion), this._profile.dir, undefined);
+    const handle = runDshPlugin(updateAddCommand(record.packageName, record.previousVersion), this._profile.dir, undefined, this._profile.name);
     const outcome = await handle.done;
     return outcome.exitCode === 0;
   }
@@ -612,6 +624,7 @@ export const __internals = {
   enableInPatch,
   argvProfile,
   resolveProfileDirectory,
+  buildPluginArgv,
   runDshPlugin,
   updateAddCommand,
   BridgePnpmService,
