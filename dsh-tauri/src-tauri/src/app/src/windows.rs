@@ -29,11 +29,11 @@ fn sanitize_label(s: &str) -> String {
 }
 
 /// 工作区逻辑尺寸 → 首次打开默认几何（纯计算，可单测）：
-/// 90% 宽/高，clamp 到 [min 980×600, 舒适上限 1280×820]，并居中于工作区。
+/// 90% 宽/高，clamp 到 [min 980×600, 舒适上限 1152×720]，并居中于工作区。
 /// 小屏（< min）会顶到 min 下限（与 min_inner_size 同口径，绝不小于最小窗）。
 fn compute_default_geometry(work_w: f64, work_h: f64, work_x: f64, work_y: f64) -> (f64, f64, f64, f64) {
-    const DEFAULT_W: f64 = 1280.0;
-    const DEFAULT_H: f64 = 820.0;
+    const DEFAULT_W: f64 = 1152.0;
+    const DEFAULT_H: f64 = 720.0;
     const MIN_W: f64 = 980.0;
     const MIN_H: f64 = 600.0;
     const RATIO: f64 = 0.9;
@@ -45,15 +45,15 @@ fn compute_default_geometry(work_w: f64, work_h: f64, work_x: f64, work_y: f64) 
 }
 
 /// 首次打开（无已存状态）默认尺寸：相对主显示器**工作区**取合理比例，
-/// 拿不到 monitor / scale_factor 非法 → 回退 1280×820（系统默认居中），
+/// 拿不到 monitor / scale_factor 非法 → 回退 1152×720（系统默认居中），
 /// 绝不 panic。返回 (w, h, Some((x, y))) 逻辑像素（inner_size/position 同口径）。
 fn default_main_window_geometry(app: &tauri::AppHandle) -> (f64, f64, Option<(f64, f64)>) {
     let Some(mon) = app.primary_monitor().ok().flatten() else {
-        return (1280.0, 820.0, None);
+        return (1152.0, 720.0, None);
     };
     let scale = mon.scale_factor();
     if scale <= 0.0 {
-        return (1280.0, 820.0, None);
+        return (1152.0, 720.0, None);
     }
     // work_area 是物理像素，除 scale_factor 转逻辑像素（inner_size/position 口径）。
     let wa = mon.work_area();
@@ -103,7 +103,7 @@ pub fn create_main_window(
         }
     } else {
         // 首次打开（无已存状态）：按当前显示器工作区取 90% 比例并居中，
-        // 拿不到 monitor 回退 1280×820（系统默认居中），绝不 panic。
+        // 拿不到 monitor 回退 1152×720（系统默认居中），绝不 panic。
         let (w, h, pos) = default_main_window_geometry(app);
         b = b.inner_size(w, h);
         if let Some((x, y)) = pos {
@@ -173,11 +173,23 @@ pub fn create_main_window(
 /// （RunEvent::ExitRequested/Exit）两条路径共用——用户调整过窗口尺寸/位置后，
 /// 无论走「关窗→托盘→退出」还是「托盘退出 / Cmd+Q」都能记住。任何读取失败
 /// （窗口已销毁 / 异常退出）都 if let 静默跳过，绝不 panic。
+///
+/// 口径对齐：outer_position/inner_size 返回**物理像素**，而恢复侧
+/// create_main_window 的 position/inner_size 吃**逻辑像素**（与
+/// default_main_window_geometry 同口径）。必须除 scale_factor 转逻辑像素，
+/// 否则高 DPI（scale≠1）下每次保存/恢复都会把窗口放大/偏移，越存越大。
 pub fn save_main_window_state(app: &tauri::AppHandle) {
     if let (Some(w), Some(state)) = (app.get_webview_window("main"), app.try_state::<crate::AppState>()) {
-        if let (Ok(pos), Ok(size)) = (w.outer_position(), w.inner_size()) {
+        if let (Ok(pos), Ok(size), Ok(scale)) = (w.outer_position(), w.inner_size(), w.scale_factor()) {
+            if scale <= 0.0 {
+                return;
+            }
             let maxed = w.is_maximized().unwrap_or(false);
-            let _ = crate::save_window_state(&state, (pos.x, pos.y, size.width as f64, size.height as f64, maxed));
+            let x = pos.x as f64 / scale;
+            let y = pos.y as f64 / scale;
+            let w = size.width as f64 / scale;
+            let h = size.height as f64 / scale;
+            let _ = crate::save_window_state(&state, (x.round() as i32, y.round() as i32, w, h, maxed));
         }
     }
 }
@@ -901,15 +913,16 @@ pub fn update_progress_inject_script(version: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 问题 1：首次打开默认几何——90% 工作区、clamp 到 [980×600, 1280×820]、
+    /// 问题 1：首次打开默认几何——90% 工作区、clamp 到 [980×600, 1152×720]、
     /// 居中于工作区（左上角 + 剩余/2）。纯计算决策表。
     #[test]
     fn default_geometry_clamps_and_centers() {
-        // 大屏（1920×1080 逻辑，无任务栏）→ 顶到舒适上限 1280×820，居中。
-        assert_eq!(compute_default_geometry(1920.0, 1080.0, 0.0, 0.0), (1280.0, 820.0, 320.0, 130.0));
-        // 笔记本 1366×768（任务栏占高，工作区 1366×728）→ 90% 且不超上限。
+        // 大屏（1920×1080 逻辑，无任务栏）→ 顶到舒适上限 1152×720，居中。
+        assert_eq!(compute_default_geometry(1920.0, 1080.0, 0.0, 0.0), (1152.0, 720.0, 384.0, 180.0));
+        // 笔记本 1366×768（任务栏占高，工作区 1366×728）→ 宽顶到 1152 上限、
+        // 高 90%（655.2），都留边距不顶屏。
         let (w, h, x, y) = compute_default_geometry(1366.0, 728.0, 0.0, 0.0);
-        assert!((w - 1229.4).abs() < 1e-9, "w={w}");
+        assert_eq!(w, 1152.0, "宽应顶到新上限 1152（1366×0.9=1229.4 > 1152）");
         assert!((h - 655.2).abs() < 1e-9, "h={h}");
         assert!((x - (1366.0 - w) / 2.0).abs() < 1e-9, "x={x}");
         assert!((y - (728.0 - h) / 2.0).abs() < 1e-9, "y={y}");
@@ -919,7 +932,7 @@ mod tests {
         assert!((x - (1024.0 - 980.0) / 2.0).abs() < 1e-9 && (y - (640.0 - 600.0) / 2.0).abs() < 1e-9);
         // 工作区左上角偏移（副屏坐标非 0,0）→ 居中基准随工作区平移。
         let (_, _, x2, y2) = compute_default_geometry(1920.0, 1080.0, 2000.0, 100.0);
-        assert_eq!((x2, y2), (2000.0 + 320.0, 100.0 + 130.0));
+        assert_eq!((x2, y2), (2000.0 + 384.0, 100.0 + 180.0));
     }
 
     #[test]
