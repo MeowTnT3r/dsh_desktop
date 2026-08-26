@@ -264,6 +264,28 @@ pub fn apply_turn_activity(activity: TurnActivity) {
     }
 }
 
+/// 解析一行 watcher 权限申请协议：`{"type":"approval-asked","sessionId"}`。
+/// 畸形 JSON / 非 approval-asked / sessionId 缺失或非法 → None（整行丢弃）。
+/// 供「权限申请时任务栏闪烁」提醒（无需 title/body，只要有个可信 sessionId）。
+pub(crate) fn parse_approval_asked(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type")?.as_str()? != "approval-asked" {
+        return None;
+    }
+    let session_id = v.get("sessionId")?.as_str()?.trim().to_string();
+    if !valid_jump_session_id(&session_id) {
+        return None;
+    }
+    Some(session_id)
+}
+
+/// 主窗是否聚焦（可见且聚焦）。
+fn main_window_focused(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// capped 读行的结果。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LineOutcome {
@@ -495,6 +517,11 @@ fn run_watcher(app: AppHandle, my_gen: u64, paths: WatcherPaths) {
                         if r.is_err() {
                             log("[notify] turn-end 处理 panic（已隔离，继续）".to_string());
                         }
+                    }
+                    // 权限申请（内核 approval/asked）：主窗未聚焦时任务栏闪烁，
+                    // 提醒用户回来看审批（与任务完成闪烁同用 Informational）。
+                    if parse_approval_asked(&line).is_some() && !main_window_focused(&app) {
+                        request_main_window_attention(&app);
                     }
                 }
                 Ok(LineOutcome::Oversized) => {
@@ -991,6 +1018,30 @@ mod turn_activity_tests {
         apply_turn_activity(TurnActivity::End(0));
         assert_eq!(active_turns(), 1, "End(0) 不减");
         reset_active_turns();
+    }
+
+    #[test]
+    fn parse_approval_asked_shapes() {
+        assert_eq!(
+            parse_approval_asked(r#"{"type":"approval-asked","sessionId":"s-1"}"#),
+            Some("s-1".to_string())
+        );
+        assert_eq!(
+            parse_approval_asked(r#"{"type":"approval-asked","sessionId":"  s-1  "}"#),
+            Some("s-1".to_string()),
+            "sessionId trim"
+        );
+        for bad in [
+            "",
+            "not json",
+            "{",
+            r#"{"type":"turn-end","sessionId":"s"}"#,
+            r#"{"type":"approval-asked"}"#,
+            r#"{"type":"approval-asked","sessionId":123}"#,
+            r#"{"type":"approval-asked","sessionId":"  "}"#,
+        ] {
+            assert_eq!(parse_approval_asked(bad), None, "应拒收：{bad}");
+        }
     }
 }
 

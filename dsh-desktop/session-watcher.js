@@ -134,12 +134,15 @@ function expandRow(line) {
 }
 
 class SessionWatcher {
-  constructor({ sessionsDir, onTurnEnd, onTurnStart, log, statSweepMs, walkSweepMs }) {
+  constructor({ sessionsDir, onTurnEnd, onTurnStart, onApprovalAsked, log, statSweepMs, walkSweepMs }) {
     this.sessionsDir = sessionsDir;
     this.onTurnEnd = onTurnEnd || (() => {});
     // 回合进行中信号（供内核探活环「忙碌」判定）：顶层会话看到 turn/start
     // 即进入进行中、turn/end 即结束。默认 noop——Electron 通知路径不受影响。
     this.onTurnStart = onTurnStart || (() => {});
+    // 权限申请信号（内核 approval/asked 写入会话事件流）：用于任务栏闪烁等
+    // 未聚焦提醒。默认 noop——不影响既有通知路径。
+    this.onApprovalAsked = onApprovalAsked || (() => {});
     this.log = log || (() => {});
     this.files = new Map(); // absPath -> { consumed, lastSize, header, title, baseline }
     this.dirCache = { at: 0, files: [] };
@@ -338,6 +341,7 @@ class SessionWatcher {
         let turnStarts = 0;
         let turnEnds = 0;
         let assistantMessages = 0;
+        let approvalAsked = 0;
         for (const f of frames) {
           let text;
           try { text = decodeFrame(tail.subarray(f.start, f.end)); } catch { break; }
@@ -350,10 +354,12 @@ class SessionWatcher {
               if (ev.type === 'turn/start') turnStarts += 1;
               if (ev.type === 'turn/end') turnEnds += 1;
               if (ev.type === 'assistant/message') assistantMessages += 1;
+              if (ev.type === 'approval/asked') approvalAsked += 1;
             }
           }
         }
         if (turnStarts > 0) this.emitStart(rec, turnStarts);
+        if (approvalAsked > 0) this.emitApprovalAsked(rec);
         const count = rec.hasTurnEvents ? turnEnds : assistantMessages;
         if (count > 0) this.emit(rec, count, rec.hasTurnEvents);
       }
@@ -367,6 +373,7 @@ class SessionWatcher {
     let turnStarts = 0;
     let turnEnds = 0;
     let assistantMessages = 0;
+    let approvalAsked = 0;
     let consumed = readFrom;
     for (const f of frames) {
       let text;
@@ -380,6 +387,7 @@ class SessionWatcher {
           if (ev.type === 'turn/start') turnStarts += 1;
           if (ev.type === 'turn/end') turnEnds += 1;
           if (ev.type === 'assistant/message') assistantMessages += 1;
+          if (ev.type === 'approval/asked') approvalAsked += 1;
         }
       }
       consumed = readFrom + f.end;
@@ -389,6 +397,7 @@ class SessionWatcher {
 
     // 回合进行中信号先于完成通知（探活环据此判定「忙碌」不误杀）。
     if (turnStarts > 0) this.emitStart(rec, turnStarts);
+    if (approvalAsked > 0) this.emitApprovalAsked(rec);
     // 通知语义：会话出现 turn 事件后按 turn/end 计数，否则按 assistant/message 兜底。
     const count = rec.hasTurnEvents ? turnEnds : assistantMessages;
     if (count > 0) this.emit(rec, count, rec.hasTurnEvents);
@@ -420,6 +429,14 @@ class SessionWatcher {
     if (h.delegationDepth > 0) return; // subagent 不参与内核忙碌判定
     try { this.onTurnStart({ sessionId: h.id, count }); }
     catch (err) { this.log('watch', 'onTurnStart 回调异常: ' + err.message); }
+  }
+
+  /** 权限申请信号（顶层会话看到 approval/asked 即上报一次，供任务栏闪烁）。 */
+  emitApprovalAsked(rec) {
+    const h = rec.header || {};
+    if (h.delegationDepth > 0) return; // subagent 审批不打扰主窗
+    try { this.onApprovalAsked({ sessionId: h.id }); }
+    catch (err) { this.log('watch', 'onApprovalAsked 回调异常: ' + err.message); }
   }
 }
 
@@ -471,6 +488,17 @@ if (require.main === module) {
         process.stdout.write(JSON.stringify(line) + '\n');
       } catch {
         // stdout 已断（父进程退出中）：安静退出，不留孤儿。
+        try { watcher.stop(); } catch {}
+        process.exit(0);
+      }
+    },
+    onApprovalAsked: function (info) {
+      try {
+        process.stdout.write(JSON.stringify({
+          type: 'approval-asked',
+          sessionId: typeof info.sessionId === 'string' ? info.sessionId : null,
+        }) + '\n');
+      } catch {
         try { watcher.stop(); } catch {}
         process.exit(0);
       }
