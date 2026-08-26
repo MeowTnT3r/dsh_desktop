@@ -62,7 +62,8 @@ client-updater / plugin-manager）、内核（@deepseek-ai/dsh 0.1.1-rc.1 全家
 
 ## 供应链说明（「很多 GitHub 下载的组件」）
 
-- 内核更新：npm registry（npm 自带 sha512 完整性）。
+- 内核随客户端整体分发（v0.5.3 起无独立 npm 内核更新链；客户端更新走
+  GitHub/Gitee Release 安装包，见下）。
 - 壳层插件管理器：npm dist.integrity（sha512）或 GitHub Release API digest（sha256），
   镜像下载同样过校验，无校验和的资产直接拒绝。
 - 壳层客户端自更新：GitHub/Gitee Release 安装包，当前仅 64MB 下限 + content-length

@@ -258,107 +258,107 @@
       "text": "tauri 构建"
     },
     {
-      "line": 321,
+      "line": 341,
       "text": "[pages] preview-server 启动失败（降级 data: 内嵌页）: {e}"
     },
     {
-      "line": 323,
+      "line": 343,
       "text": "<!doctype html><meta charset=\\\"utf-8\\\"><body style=\\\"font:14px system-ui;background:#0b1220;color:#d7dde4;display:flex;align-items:center;justify-content:center;height:100vh\\\"><div style=\\\"max-width:520px\\\">静态页服务启动失败，请查看日志目录：<br>{}<br>重启应用可重试。</div></body>"
     },
     {
-      "line": 336,
+      "line": 356,
       "text": "DSH Desktop 已在运行"
     },
     {
-      "line": 382,
+      "line": 402,
       "text": "[boot] 内核装配失败（主窗转恢复页，不退出）: {e}"
     },
     {
-      "line": 392,
+      "line": 412,
       "text": "[tray] 初始化失败（不影响主窗）: {e}"
     },
     {
-      "line": 409,
+      "line": 429,
       "text": "[update] 检测到客户端新版本 {} → {}（{}，{}）"
     },
     {
-      "line": 415,
+      "line": 435,
       "text": "[update] 启动更新检查失败（静默忽略）：{e}"
     },
     {
-      "line": 449,
+      "line": 469,
       "text": "[route] 事件路由 panic（已隔离，继续处理后续事件）"
     },
     {
-      "line": 505,
+      "line": 525,
       "text": "[route] 内核 URL 变更（端口漂移），跳过渲染抑制直接换页（{url}）"
     },
     {
-      "line": 525,
+      "line": 545,
       "text": "[route] 重启风暴渲染抑制：距上次换页 <{KERNEL_NAV_SUPPRESS_WINDOW_MS}ms 且页面存活，跳过整页换页（{url}）"
     },
     {
-      "line": 527,
+      "line": 547,
       "text": "[route] 重启风暴渲染抑制：页面探针无响应，执行整页换页（{url}）"
     },
     {
-      "line": 545,
+      "line": 565,
       "text": "[route] boot 步骤 {name} OK（{ms}ms）"
     },
     {
-      "line": 547,
+      "line": 567,
       "text": "[route] boot 步骤 {name} FAIL（{ms}ms）: {}"
     },
     {
-      "line": 547,
+      "line": 567,
       "text": "未知失败"
     },
     {
-      "line": 589,
+      "line": 609,
       "text": "[route] 内核退出 code={code:?}"
     },
     {
-      "line": 593,
+      "line": 613,
       "text": "[route] 崩溃环触发（累计 {crashes} 次），主窗转恢复页"
     },
     {
-      "line": 594,
+      "line": 614,
       "text": "内核反复异常退出"
     },
     {
-      "line": 601,
+      "line": 621,
       "text": "内核服务反复异常退出，已进入恢复模式"
     },
     {
-      "line": 605,
+      "line": 625,
       "text": "[route] 探活失败 ×{consecutive}"
     },
     {
-      "line": 609,
+      "line": 629,
       "text": "[route] 内核假死可疑 ×{consecutive}（端口通、HTTP 无响应）"
     },
     {
-      "line": 655,
+      "line": 675,
       "text": "DSH_TAURI_REPO_ROOT={root} 不含 dsh-desktop/vendor/node"
     },
     {
-      "line": 673,
+      "line": 693,
       "text": "未找到内核目录 dsh-desktop（开发检出与安装产物布局均未命中；可设 DSH_TAURI_REPO_ROOT 指定）"
     },
     {
-      "line": 702,
+      "line": 722,
       "text": "显示主窗口"
     },
     {
-      "line": 703,
+      "line": 723,
       "text": "打开日志"
     },
     {
-      "line": 705,
+      "line": 725,
       "text": "退出"
     },
     {
-      "line": 708,
+      "line": 728,
       "text": "无应用图标"
     }
   ],
