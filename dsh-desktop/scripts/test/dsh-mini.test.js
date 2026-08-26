@@ -184,6 +184,94 @@ test('decompressFrames：from 偏移起解析多帧，返回 {text, end}', () =>
   assert.ok(!tail.text.includes('session-f1') && tail.text.includes('session-f2'), 'from 之后只解后续帧');
 });
 
+// ---------------------------------------------------------------------------
+// zstd-log.js —— 历史加载优化（头部只读 + 尾部降级，2026-08 卡顿/报错根治）
+// ---------------------------------------------------------------------------
+test('readHeadBuffer：只读前 maxBytes、空上限、缺文件', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mini-head-'));
+  const p = path.join(tmp, 'big.bin');
+  try {
+    fs.writeFileSync(p, Buffer.alloc(1024 * 1024, 7));
+    const head = zlog.readHeadBuffer(p, 256 * 1024);
+    assert.ok(Buffer.isBuffer(head), '应返回 Buffer');
+    assert.strictEqual(head.length, 256 * 1024, '只读 256KB 而非整文件（1MB）');
+    assert.ok(head.every((b) => b === 7), '内容应为文件前 256KB');
+    assert.strictEqual(zlog.readHeadBuffer(p, 0).length, 0, '上限 0 → 空 buffer');
+    assert.strictEqual(zlog.readHeadBuffer(path.join(tmp, 'nope'), 1024), null, '缺文件返回 null');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('firstEventId：zstd / 纯文本 / 垃圾 / 空输入', () => {
+  const line = '{"id":"session-h1","type":"session","title":"t"}\n';
+  const zf = zstdCompressSync(Buffer.from(line));
+  assert.strictEqual(zlog.firstEventId(zf, true), 'session-h1', 'zstd 首帧取 id');
+  assert.strictEqual(zlog.firstEventId(Buffer.from(line), false), 'session-h1', '纯文本首行取 id');
+  assert.strictEqual(zlog.firstEventId(Buffer.from('not json\n'), false), undefined, '非 JSON → undefined');
+  assert.strictEqual(zlog.firstEventId(Buffer.alloc(0), true), undefined, '空 buffer → undefined');
+  assert.strictEqual(zlog.firstEventId(null, true), undefined, 'null → undefined');
+});
+
+test('decompressTailFrames：只解压最后 N 帧并标记 truncated', () => {
+  const lines = Array.from({ length: 8 }, (_, i) => `{"seq":${i + 1}}\n`);
+  const frames = lines.map((l) => zstdCompressSync(Buffer.from(l)));
+  const cat = Buffer.concat(frames);
+  const tail = zlog.decompressTailFrames(cat, 3);
+  assert.strictEqual(tail.totalFrames, 8, '应扫到 8 帧');
+  assert.strictEqual(tail.truncated, true, '8 帧 > 3 帧 → truncated');
+  assert.ok(!tail.text.includes('"seq":1') && !tail.text.includes('"seq":5'), '应裁掉最早 5 帧');
+  assert.ok(tail.text.includes('"seq":6') && tail.text.includes('"seq":8'), '应保留最后 3 帧');
+  const noTrunc = zlog.decompressTailFrames(cat, 100);
+  assert.strictEqual(noTrunc.truncated, false, '帧数不超上限 → 不 truncated');
+  assert.ok(noTrunc.text.includes('"seq":1') && noTrunc.text.includes('"seq":8'), '全量解压保留全部帧');
+});
+
+test('walkSessionFiles：文件超过头部读上限仍能只读头部定位 session id', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mini-walkbig-'));
+  const sessions = path.join(tmp, 'sessions');
+  const sdir = path.join(sessions, 's1');
+  fs.mkdirSync(sdir, { recursive: true });
+  const filePath = path.join(sdir, 'session.jsonl.zstd');
+  try {
+    // 合法 header 帧 + 大量非 zstd 垃圾尾部，把文件撑到 >256KB（头部读上限）。
+    const head = zstdCompressSync(Buffer.from('{"id":"session-big1","type":"session","title":"big"}\n'));
+    fs.writeFileSync(filePath, Buffer.concat([head, Buffer.alloc(512 * 1024, 0)]));
+    assert.ok(fs.statSync(filePath).size > 256 * 1024, '文件应大于头部读上限');
+    zlog.resetFileMapCache();
+    const m = zlog.walkSessionFiles(tmp);
+    assert.strictEqual(m.get('session-big1'), filePath, '只读头部即可定位 id（不读全文件）');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('readAllLogEvents / foldLogEvents：多帧文件完整读与折叠（回归）', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mini-events-'));
+  const filePath = path.join(tmp, 'session.jsonl.zstd');
+  try {
+    const lines = [
+      '{"id":"session-e1","type":"session","title":"标题","time":1}\n',
+      '{"type":"user/message","seq":1,"time":2}\n',
+      '{"type":"assistant/message","seq":2,"time":3}\n',
+    ];
+    const frames = lines.map((l) => zstdCompressSync(Buffer.from(l)));
+    fs.writeFileSync(filePath, Buffer.concat(frames));
+
+    const events = zlog.readAllLogEvents(filePath);
+    assert.strictEqual(events.length, 3, '应完整读回 3 个事件');
+    assert.strictEqual(events[0].id, 'session-e1');
+    assert.strictEqual(events[2].seq, 2, '尾部事件 seq 正确');
+
+    const fold = zlog.foldLogEvents(filePath);
+    assert.strictEqual(fold.title, '标题', 'fold 应提取 title');
+    assert.strictEqual(fold.updatedAt, 3, 'fold 应取最大 time');
+    assert.strictEqual(fold.events.length, 3);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('walkSessionFiles：TTL 内复用缓存、reset 重建、缺目录不抛错', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mini-zstd-test-'));
   const sessions = path.join(tmp, 'sessions');

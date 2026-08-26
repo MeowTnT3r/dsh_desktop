@@ -1,7 +1,7 @@
 // @deepseek-ai/dsh-mini — zstd-log.js
 // zstd-framed session log 读取工具（dsh-side-session 模式），供 index.js（旧手机页）
 // 与 gui-api.js（v3 GUI history）共用。模块级缓存跨两处共享。
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { zstdDecompressSync } from "node:zlib";
@@ -9,6 +9,11 @@ import { zstdDecompressSync } from "node:zlib";
 const ZSTD_MAGIC = 4247762216; // 0xFD2FB528 LE
 const FILE_MAP_TTL_MS = 60_000;
 const MAX_LOG_EVENTS = 4000;
+// 头部只读上限：仅覆盖第一条 zstd 帧的 header（对齐内核 256KB 封顶先例）。
+const SESSION_HEAD_READ_BYTES = 256 * 1024;
+// 全量解压上限：超过该压缩字节数即退化为「只读尾部 N 帧」，避免超大日志 OOM。
+const MAX_LOG_DECOMPRESS_BYTES = 16 * 1024 * 1024;
+const MAX_LOG_TAIL_FRAMES = 512;
 
 export { ZSTD_MAGIC };
 
@@ -78,6 +83,26 @@ export function decompressFrames(buf, from) {
   return { text: out, end: offset };
 }
 
+// 只扫帧边界、不解压，然后仅解压最后 `maxFrames` 帧。超大日志缓存 miss 时的
+// 有界降级：避免把整份日志全量解压进内存导致 OOM/卡死。返回 totalFrames 供
+// 上层判断是否发生了裁剪（truncated）。
+export function decompressTailFrames(buf, maxFrames) {
+  const starts = [];
+  let offset = 0;
+  for (;;) {
+    const f = scanFrame(buf, offset);
+    if (!f) break;
+    starts.push(f.start);
+    offset = f.end;
+    if (offset >= buf.length) break;
+  }
+  if (starts.length === 0) return { text: "", end: 0, totalFrames: 0, truncated: false };
+  const truncated = starts.length > maxFrames;
+  const from = truncated ? starts[starts.length - maxFrames] : 0;
+  const { text, end } = decompressFrames(buf, from);
+  return { text, end, totalFrames: starts.length, truncated };
+}
+
 export function parseLines(text) {
   return text
     .split(/\r?\n/)
@@ -99,6 +124,62 @@ export function resetFileMapCache() {
   fileMapCache = { at: 0, map: new Map() };
 }
 
+// 有界头部读：只读文件前 `maxBytes` 字节。walkSessionFiles 只要第一条事件的
+// id，绝不能对每个会话整读多 MB 日志（O(n × 会话总字节) 遍历即卡顿源）。
+export function readHeadBuffer(path, maxBytes) {
+  let st;
+  try {
+    st = statSync(path);
+  } catch {
+    return null;
+  }
+  const size = Math.min(st.size, maxBytes);
+  if (size <= 0) return Buffer.alloc(0);
+  let fd;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const buf = Buffer.alloc(size);
+    let off = 0;
+    while (off < size) {
+      const n = readSync(fd, buf, off, size - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    return buf.subarray(0, off);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// 从首帧（header）第一行提取 session id；非 zstd 走纯文本首行。空/损坏返回 undefined。
+export function firstEventId(headBuf, isZstd) {
+  if (!headBuf || headBuf.length === 0) return undefined;
+  let head = null;
+  if (isZstd) {
+    const f = scanFrame(headBuf, 0);
+    if (f) {
+      try {
+        head = JSON.parse(
+          zstdDecompressSync(headBuf.subarray(f.start, f.end)).toString("utf8").split("\n", 1)[0]
+        );
+      } catch {
+        /* skip */
+      }
+    }
+  } else {
+    try {
+      head = JSON.parse(headBuf.toString("utf8").split("\n", 1)[0]);
+    } catch {
+      /* skip */
+    }
+  }
+  return head && typeof head.id === "string" ? head.id : undefined;
+}
+
 export function walkSessionFiles(dshHome) {
   const now = Date.now();
   if (now - fileMapCache.at < FILE_MAP_TTL_MS && fileMapCache.map.size > 0) {
@@ -117,30 +198,11 @@ export function walkSessionFiles(dshHome) {
     for (const e of entries) {
       if (e.isDirectory()) visit(join(dir, e.name), depth + 1);
       else if (e.name === "session.jsonl.zstd" || e.name === "session.jsonl") {
+        const p = join(dir, e.name);
         try {
-          const p = join(dir, e.name);
-          const buf = readFileSync(p);
-          let head = null;
-          if (e.name.endsWith(".zstd")) {
-            const f = scanFrame(buf, 0);
-            if (f) {
-              try {
-                head = JSON.parse(
-                  zstdDecompressSync(buf.subarray(f.start, f.end)).toString("utf8").split("\n", 1)[0]
-                );
-              } catch {
-                /* skip */
-              }
-            }
-          } else {
-            try {
-              head = JSON.parse(buf.toString("utf8").split("\n", 1)[0]);
-            } catch {
-              /* skip */
-            }
-          }
-          const id = head && head.id;
-          if (typeof id === "string" && !map.has(id)) map.set(id, p);
+          const headBuf = readHeadBuffer(p, SESSION_HEAD_READ_BYTES);
+          const id = firstEventId(headBuf, e.name.endsWith(".zstd"));
+          if (id !== undefined && !map.has(id)) map.set(id, p);
         } catch {
           /* skip */
         }
@@ -251,15 +313,32 @@ export function foldLogEvents(file) {
     }
   }
   if (!state) {
-    let raw;
-    if (isZstd) {
-      raw = decompressZstd(buf);
-    } else {
-      raw = buf.toString("utf8");
-    }
     state = freshFoldState();
-    foldInto(state, parseLines(raw));
-    frameEnd = isZstd ? decompressFrames(buf, 0).end : buf.length;
+    if (isZstd) {
+      if (buf.length > MAX_LOG_DECOMPRESS_BYTES) {
+        // 有界降级：只折叠 header 帧 + 最后 N 帧。title 从 header 帧保留，
+        // asOfSeq/updatedAt 取自尾部；避免超大日志全量解压 OOM/卡死。
+        const hf = scanFrame(buf, 0);
+        let headText = "";
+        if (hf) {
+          try {
+            headText = zstdDecompressSync(buf.subarray(hf.start, hf.end)).toString("utf8");
+          } catch {
+            /* ignore */
+          }
+        }
+        const tail = decompressTailFrames(buf, MAX_LOG_TAIL_FRAMES);
+        if (tail.truncated && headText) foldInto(state, parseLines(headText));
+        if (tail.text) foldInto(state, parseLines(tail.text));
+        frameEnd = tail.end;
+      } else {
+        foldInto(state, parseLines(decompressZstd(buf)));
+        frameEnd = decompressFrames(buf, 0).end;
+      }
+    } else {
+      foldInto(state, parseLines(buf.toString("utf8")));
+      frameEnd = buf.length;
+    }
   }
   const entry = { mtimeMs: st.mtimeMs, size: st.size, firstMagic, isZstd, frameEnd, state };
   foldCache.set(file, entry);
@@ -295,9 +374,20 @@ export function readAllLogEvents(file) {
       events = cached.events;
       if (inc.text) events = events.concat(parseLines(inc.text));
       frameEnd = inc.end;
+    } else if (isZstd) {
+      if (buf.length > MAX_LOG_DECOMPRESS_BYTES) {
+        // 有界降级：只保留尾部帧（session.history 真正需要的最近事件），
+        // 不全量解压超大日志，避免 OOM/卡死。
+        const tail = decompressTailFrames(buf, MAX_LOG_TAIL_FRAMES);
+        events = parseLines(tail.text);
+        frameEnd = tail.end;
+      } else {
+        events = parseLines(decompressZstd(buf));
+        frameEnd = decompressFrames(buf, 0).end;
+      }
     } else {
-      events = isZstd ? parseLines(decompressZstd(buf)) : parseLines(buf.toString("utf8"));
-      frameEnd = isZstd ? decompressFrames(buf, 0).end : buf.length;
+      events = parseLines(buf.toString("utf8"));
+      frameEnd = buf.length;
     }
     allEventsCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, isZstd, frameEnd, events });
     capMap(allEventsCache, 200);
