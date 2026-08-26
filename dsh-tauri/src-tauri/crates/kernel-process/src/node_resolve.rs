@@ -43,7 +43,7 @@ pub const NODE_BINARY_NAME: &str = "node";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedNode {
     /// 系统 PATH 命中且大版本 ≥ 22。
-    System { exe: PathBuf, major: u32 },
+    System { exe: PathBuf, major: u32, minor: u32 },
     /// 内置 vendor node 保底命中。
     Vendor(PathBuf),
 }
@@ -60,23 +60,55 @@ impl ResolvedNode {
     /// 日志标签（boot 瀑布首步透出，用户可自查命中的是哪一级）。
     pub fn label(&self) -> String {
         match self {
-            ResolvedNode::System { exe, major } => {
+            ResolvedNode::System { exe, major, .. } => {
                 format!("系统 node v{major}（{}）", exe.display())
             }
             ResolvedNode::Vendor(p) => format!("内置 vendor node（{}）", p.display()),
         }
     }
+
+    /// 该 node 是否支持 `--use-system-ca`（node 级参数）。
+    ///
+    /// vendor 内置 node（v24）恒支持；系统 node 按版本门控（见
+    /// [`node_use_system_ca_supported`]）。issue #163：系统 node 为 22.0–22.14
+    /// 时 `--use-system-ca` 尚未引入（`bad option: --use-system-ca`，退出码 9），
+    /// 必须撤下该 flag，否则内核起不来。
+    pub fn supports_use_system_ca(&self) -> bool {
+        match self {
+            ResolvedNode::Vendor(_) => true,
+            ResolvedNode::System { major, minor, .. } => node_use_system_ca_supported(*major, *minor),
+        }
+    }
 }
 
-/// 解析 `"v22.14.0"` / `"22.14.0"` → `Some(22)`；垃圾输入（商店 stub 输出、
-/// 空串、含非数字前缀）→ `None`。纯函数。
-pub fn parse_node_major(ver: &str) -> Option<u32> {
+/// `--use-system-ca` 的 node 版本门槛（Node 官方 changelog，纯函数可单测）。
+///
+/// - v22：`>= 22.15.0`（#56833 Windows / #56599 macOS / #57009 其余，均同一版）；
+/// - v23：Windows/macOS `>= 23.8.0`，其余平台 `>= 23.9.0`——取 23.9 保守口径，
+///   最坏情况只是少发一个 flag（TLS 退回内置 CA），不影响内核启动；
+/// - v24+：全支持（分支自 v22.15.0/v23.8.0 之后）。
+pub fn node_use_system_ca_supported(major: u32, minor: u32) -> bool {
+    match major {
+        22 => minor >= 15,
+        23 => minor >= 9,
+        _ => major >= 24,
+    }
+}
+
+/// 解析 `"v22.14.0"` / `"22.14.0"` → `Some((22, 14))`（major, minor）；垃圾输入
+/// （商店 stub 输出、空串、含非数字前缀）→ `None`。纯函数。
+pub fn parse_node_version(ver: &str) -> Option<(u32, u32)> {
     let v = ver.trim().trim_start_matches('v');
-    let major = v.split('.').next()?.trim();
+    let mut it = v.split('.');
+    let major = it.next()?.trim();
     if major.is_empty() || !major.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    major.parse().ok()
+    let minor = it.next().unwrap_or("0").trim();
+    if minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 /// 探测原语（生产 [`RealNodeProbe`]；测试注桩——优先级矩阵的确定性验证）。
@@ -109,9 +141,9 @@ impl NodeProbe for RealNodeProbe {
 /// 三级解析链核心（注桩可测）：系统 node（版本达标）→ vendor → None。
 pub fn resolve_node_with(probe: &dyn NodeProbe, vendor: Option<PathBuf>) -> Option<ResolvedNode> {
     if let Some(exe) = probe.find_node_in_path() {
-        if let Some(major) = probe.node_version(&exe).as_deref().and_then(parse_node_major) {
+        if let Some((major, minor)) = probe.node_version(&exe).as_deref().and_then(parse_node_version) {
             if major >= MIN_NODE_MAJOR {
-                return Some(ResolvedNode::System { exe, major });
+                return Some(ResolvedNode::System { exe, major, minor });
             }
         }
     }
@@ -228,18 +260,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_node_major_forms() {
-        assert_eq!(parse_node_major("v22.14.0"), Some(22));
-        assert_eq!(parse_node_major("22.14.0"), Some(22));
-        assert_eq!(parse_node_major("v24.15.0\n"), Some(24));
-        assert_eq!(parse_node_major("v22.14.0-nightly.1"), Some(22));
-        assert_eq!(parse_node_major("v0.10.32"), Some(0));
+    fn parse_node_version_forms() {
+        assert_eq!(parse_node_version("v22.14.0"), Some((22, 14)));
+        assert_eq!(parse_node_version("22.14.0"), Some((22, 14)));
+        assert_eq!(parse_node_version("v24.15.0\n"), Some((24, 15)));
+        assert_eq!(parse_node_version("v22.14.0-nightly.1"), Some((22, 14)));
+        assert_eq!(parse_node_version("v0.10.32"), Some((0, 10)));
+        assert_eq!(parse_node_version("v22"), Some((22, 0)), "缺 minor 按 0 补");
         // 商店 stub / 报错文本 / 空串 → None（不得 panic、不得误判 0 后放过）。
-        assert_eq!(parse_node_major(""), None);
-        assert_eq!(parse_node_major("此应用无法在你的电脑上运行"), None);
-        assert_eq!(parse_node_major("not recognized"), None);
-        assert_eq!(parse_node_major("vX.Y.Z"), None);
-        assert_eq!(parse_node_major("vv22.1.0"), Some(22), "多 v 前缀仍可解析");
+        assert_eq!(parse_node_version(""), None);
+        assert_eq!(parse_node_version("此应用无法在你的电脑上运行"), None);
+        assert_eq!(parse_node_version("not recognized"), None);
+        assert_eq!(parse_node_version("vX.Y.Z"), None);
+        assert_eq!(parse_node_version("vv22.1.0"), Some((22, 1)), "多 v 前缀仍可解析");
+    }
+
+    #[test]
+    fn use_system_ca_gate() {
+        // issue #163：系统 node v22.0–v22.14 尚无 `--use-system-ca`（bad option，退出码 9）。
+        assert!(!node_use_system_ca_supported(22, 0));
+        assert!(!node_use_system_ca_supported(22, 14));
+        assert!(node_use_system_ca_supported(22, 15));
+        assert!(node_use_system_ca_supported(22, 23));
+        // v23 保守口径（非 Windows/macOS 需 23.9；Windows/macOS 只需 23.8）。
+        assert!(!node_use_system_ca_supported(23, 0));
+        assert!(!node_use_system_ca_supported(23, 8));
+        assert!(node_use_system_ca_supported(23, 9));
+        // v24+ 全支持；v21 及以下不支持（本就不该命中）。
+        assert!(node_use_system_ca_supported(24, 0));
+        assert!(node_use_system_ca_supported(26, 1));
+        assert!(!node_use_system_ca_supported(21, 7));
+    }
+
+    #[test]
+    fn supports_use_system_ca_per_source() {
+        let v = ResolvedNode::Vendor(PathBuf::from("/app/vendor/node/node.exe"));
+        assert!(v.supports_use_system_ca(), "vendor node（v24）恒支持");
+        let s_old = ResolvedNode::System { exe: PathBuf::from("/usr/bin/node"), major: 22, minor: 14 };
+        assert!(!s_old.supports_use_system_ca(), "系统 v22.14 不支持");
+        let s_ok = ResolvedNode::System { exe: PathBuf::from("/usr/bin/node"), major: 22, minor: 15 };
+        assert!(s_ok.supports_use_system_ca(), "系统 v22.15 支持");
     }
 
     #[test]
@@ -248,7 +308,7 @@ mod tests {
         let p = probe(Some("v24.15.0"));
         assert_eq!(
             resolve_node_with(&p, Some(vendor.clone())),
-            Some(ResolvedNode::System { exe: p.path_hit.clone().unwrap(), major: 24 }),
+            Some(ResolvedNode::System { exe: p.path_hit.clone().unwrap(), major: 24, minor: 15 }),
             "系统 node ≥22 优先于内置 vendor（省 91MB 口径）"
         );
         // 恰好 22：下限含端点。
@@ -292,7 +352,7 @@ mod tests {
 
     #[test]
     fn label_mentions_source_and_path() {
-        let s = ResolvedNode::System { exe: PathBuf::from("/usr/bin/node"), major: 24 };
+        let s = ResolvedNode::System { exe: PathBuf::from("/usr/bin/node"), major: 24, minor: 15 };
         assert!(s.label().contains("v24") && s.label().contains("系统"));
         let v = ResolvedNode::Vendor(PathBuf::from("/app/vendor/node/node.exe"));
         assert!(v.label().contains("vendor"));

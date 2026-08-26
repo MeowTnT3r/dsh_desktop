@@ -56,7 +56,7 @@ fn main() {
         }
     };
 
-    let spec = SpawnSpec::new(&node_exe, &bin_js, &kernel_version, port, &[]);
+    let spec = SpawnSpec::new(&node_exe, &bin_js, &kernel_version, port, &[], true);
     println!("[PoC-C] spawn: {}", spec.display_cmd());
 
     let mut env_cmd = Command::new(&spec.node_exe);

@@ -908,7 +908,8 @@ impl Supervisor {
             ));
             backend.spawn_server(no_open).map_err(|e| format!("spawn wsl.exe: {e}"))?
         } else {
-            let spec = SpawnSpec::new(&self.node_exe, &self.bin_js, &self.kernel_version, port, &overlays);
+            let use_system_ca = self.node_resolved.as_ref().map(|r| r.supports_use_system_ca()).unwrap_or(false);
+            let spec = SpawnSpec::new(&self.node_exe, &self.bin_js, &self.kernel_version, port, &overlays, use_system_ca);
             let mut cmd = Command::new(&spec.node_exe);
             cmd.args(&spec.node_args).arg(&spec.bin_js).args(&spec.web_args);
             // 环境白名单 + 监管标识（main.js childEnv 语义）。

@@ -59,11 +59,18 @@ pub fn web_args(kernel_version: &str, port: u16, patch_yml: &[std::path::PathBuf
 }
 
 /// node 级参数（对齐 Electron：证书修正 + internal loader 暴露 + 崩溃屏蔽 require）。
-/// `--expose-internals`：node 级参数（execArgv），内核 loader 据此取 Node 内部
-/// ESM loader——HMR 服务与 profiles 插件的裸包名 import 都依赖（W1 问题一）。
-/// 崩溃屏蔽文件不存在时不注入（dev 检出兜底，Electron 同款）。
-pub fn node_args(crash_shield: Option<&std::path::Path>) -> Vec<String> {
-    let mut args = vec!["--use-system-ca".to_string(), "--expose-internals".to_string()];
+/// `--use-system-ca`：仅当调用方确认目标 node 支持时注入（`use_system_ca=true`）；
+/// 系统 node 为 22.0–22.14 时该 flag 尚不存在（`bad option`，退出码 9，issue #163），
+/// 撤下后 TLS 退回内置 CA，内核照常启动。`--expose-internals`：node 级参数
+/// （execArgv），内核 loader 据此取 Node 内部 ESM loader——HMR 服务与 profiles 插件的
+/// 裸包名 import 都依赖（W1 问题一）。崩溃屏蔽文件不存在时不注入（dev 检出兜底，
+/// Electron 同款）。
+pub fn node_args(crash_shield: Option<&std::path::Path>, use_system_ca: bool) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if use_system_ca {
+        args.push("--use-system-ca".to_string());
+    }
+    args.push("--expose-internals".to_string());
     if let Some(shield) = crash_shield {
         if shield.exists() {
             args.push("--require".into());
@@ -112,11 +119,12 @@ impl SpawnSpec {
         kernel_version: &str,
         port: u16,
         patch_yml: &[std::path::PathBuf],
+        use_system_ca: bool,
     ) -> Self {
         Self {
             node_exe: node_exe.into(),
             bin_js: bin_js.into(),
-            node_args: node_args(None),
+            node_args: node_args(None, use_system_ca),
             web_args: web_args(kernel_version, port, patch_yml),
             env_allow: ENV_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
         }
@@ -169,13 +177,13 @@ mod tests {
 
     #[test]
     fn node_level_args_before_bin() {
-        let spec = SpawnSpec::new("node.exe", "bin.js", "0.1.0-rc.8", 5000, &[]);
+        let spec = SpawnSpec::new("node.exe", "bin.js", "0.1.0-rc.8", 5000, &[], true);
         // W1 问题一：--expose-internals 必须在场（HMR/internal loader 依赖 execArgv 探测）。
         assert_eq!(spec.node_args, vec!["--use-system-ca", "--expose-internals"]);
         assert_eq!(spec.web_args.first().map(String::as_str), Some("web"));
         let shield = PathBuf::from("/definitely/missing-shield.js");
         assert_eq!(
-            node_args(Some(&shield)),
+            node_args(Some(&shield), true),
             vec!["--use-system-ca", "--expose-internals"],
             "屏蔽文件不存在时不注入"
         );
@@ -183,9 +191,22 @@ mod tests {
         let real = std::env::temp_dir();
         let shield_arg = real.to_string_lossy().into_owned();
         assert_eq!(
-            node_args(Some(&real)),
+            node_args(Some(&real), true),
             vec!["--use-system-ca".to_string(), "--expose-internals".to_string(), "--require".to_string(), shield_arg]
         );
+    }
+
+    #[test]
+    fn node_args_drops_use_system_ca_when_unsupported() {
+        // issue #163：系统 node 22.0–22.14 不支持 --use-system-ca，必须撤下该 flag，
+        // 但 --expose-internals 仍在（内核 HMR/internal loader 依赖）。
+        assert_eq!(
+            node_args(None, false),
+            vec!["--expose-internals"],
+            "不支持时撤下 --use-system-ca，保留 --expose-internals"
+        );
+        let spec = SpawnSpec::new("node.exe", "bin.js", "0.1.0-rc.8", 5000, &[], false);
+        assert_eq!(spec.node_args, vec!["--expose-internals"]);
     }
 
     #[test]
