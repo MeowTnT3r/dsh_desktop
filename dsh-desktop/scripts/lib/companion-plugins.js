@@ -112,6 +112,10 @@ const COMPANION_PLUGINS = [
   // （零 MCP 已添加时也显示「新建」按钮）。id 与 bundle 层 cordis.patch.yml
   // 声明的 loader id（basics-panel）一致。
   { id: 'basics-panel', name: 'dsh-basics-panel' },
+  // 用户提示词折叠（本仓库内置）：对用户发出去的超长提示词（user 消息）默认
+  // 折叠为前几行 + 「展开」遮罩，点击展开全文、再点「收起」收回；短消息零
+  // 侵入、不碰代码块/图片/表格。纯客户端（DOM 定位 + CSS 折叠 + 事件委托）。
+  { id: 'input-fold', name: 'dsh-input-fold' },
 ];
 
 /** 包名 → assets/plugins 下的目录名（去 scope 前缀）。 */
