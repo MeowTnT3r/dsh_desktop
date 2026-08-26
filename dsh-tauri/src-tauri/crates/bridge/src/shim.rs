@@ -343,7 +343,7 @@ mod window_chrome_tests {
 
     /// ⋯ 菜单交互契约：点击外部 / Escape 关闭；开关类 toggle 后重渲染（菜单
     /// 保持打开）；客户端更新检查就地回显（检查中…/可更新 vX/已是最新/
-    /// 检查失败）+ 下载进度百分比 + 有会话时的二次点击确认 + 启动自动检查
+    /// 检查失败）+ 下载进度百分比 + 有会话时的显式确认提示 + 启动自动检查
     /// 命中的红点/系统通知/自动安装；自愈重注不重复挂 document 监听。
     #[test]
     fn window_chrome_dots_menu_interaction() {
@@ -359,7 +359,9 @@ mod window_chrome_tests {
             "检查失败",
             "下载中 ",                       // 进度百分比（client-update-progress 驱动）
             "下载完成，正在安装…",
-            "再点一次确认",                  // 有会话运行时的安装二次确认
+            "继续安装",                       // 有会话运行时安装的显式确认（[继续安装]/[取消]）
+            "取消",
+            "确认继续",
             "markUpdateDot",                // ⋯ 按钮红点（client-update-available）
             "dch-dot",
             "plugin:notification|notify",   // 系统通知走壳内既有通知插件 IPC

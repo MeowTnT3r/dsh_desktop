@@ -666,7 +666,7 @@ async function main() {
     await flush();
     check('检查失败：<原因>（去 [CODE] 前缀）', menuPanel.textContent.includes('检查失败：boom'));
 
-    // armed：有会话运行时首点转二次确认
+    // armed：有会话运行时首点弹显式确认（不再隐晦「再点一次」二次文案）
     s.storage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: 'live-session' }));
     s.timers.advance(3000); // currentSession 轮询 3s
     menuPanel.querySelector('[data-act="check-client-update"]').onclick();
@@ -676,14 +676,23 @@ async function main() {
     const inst = menuPanel.querySelector('[data-act="install-client-update"]');
     check('可更新态 install 按钮文案「下载并安装」', inst && inst.textContent === '下载并安装');
     inst.onclick(); await flush();
-    const armed = menuPanel.querySelector('[data-act="install-client-update"]');
-    check('会话运行中首点 → armed「会话运行中，再点一次确认」',
-      armed && armed.textContent === '会话运行中，再点一次确认' && armed.getAttribute('data-armed') === '1');
+    const confirm = menuPanel.querySelector('.dch-upd-confirm');
+    check('会话运行中首点 → 弹显式确认提示', !!confirm && confirm.textContent.includes('确认继续'));
+    const go = menuPanel.querySelector('[data-act="install-client-update"]');
+    const cancel = menuPanel.querySelector('[data-act="cancel-install-confirm"]');
+    check('确认面板含「继续安装」/「取消」按钮',
+      go && go.textContent === '继续安装' && cancel && cancel.textContent === '取消');
     const installs = s.calls.filter(c => c.cmd === 'menu_action' && c.args.action === 'install-client-update');
-    check('armed 首点不发 install-client-update', installs.length === 1, String(installs.length));
-    armed.onclick(); await flush();
+    check('确认弹窗前不发 install-client-update', installs.length === 1, String(installs.length));
+    cancel.onclick(); await flush();
+    check('取消 → 回到「下载并安装」且不发 install',
+      menuPanel.querySelector('[data-act="install-client-update"]').textContent === '下载并安装'
+      && s.calls.filter(c => c.cmd === 'menu_action' && c.args.action === 'install-client-update').length === 1);
+    menuPanel.querySelector('[data-act="install-client-update"]').onclick(); await flush();
+    check('再点 → 再次弹确认', menuPanel.querySelector('[data-act="install-client-update"]').textContent === '继续安装');
+    menuPanel.querySelector('[data-act="install-client-update"]').onclick(); await flush();
     const installs2 = s.calls.filter(c => c.cmd === 'menu_action' && c.args.action === 'install-client-update');
-    check('armed 次点真正安装', installs2.length === 2);
+    check('「继续安装」真正触发 install', installs2.length === 2);
   }
 
   // ---- 3.7 client-update-available：红点 / 通知 / 自动安装 ----

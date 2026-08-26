@@ -122,7 +122,8 @@ pub async fn menu_action(action: String, payload: Option<serde_json::Value>, app
             }
         }
         "install-client-update" => {
-            // 安装链：check_latest 复核（UpToDate 拒绝空装）→ download_to_temp
+            // 安装链：check_latest 复核（UpToDate → {ok,upToDate:true} 不空装，
+            // 垫片回显「已是最新」，非报错）→ download_to_temp
             // 下载（sha256 校验在 updater_client::download_to_temp 内完成：
             // None = 依次取 GitHub digest 缓存 / <url>.sha256 边车，无哈希时
             // 元数据 size + 安装器 >50MB 下限兜底——见其 doc）→ 平台分支
@@ -131,7 +132,7 @@ pub async fn menu_action(action: String, payload: Option<serde_json::Value>, app
             let outcome = updater_client::check_latest(&current).await.map_err(updater_err_to_bridge)?;
             let upd = match outcome {
                 CheckOutcome::Available(u) => u,
-                CheckOutcome::UpToDate => return Err(BridgeError::not_found("已是最新版本")),
+                CheckOutcome::UpToDate => return Ok(serde_json::json!({ "ok": true, "upToDate": true })),
             };
             let next = upd.next.clone();
             // 进度弹窗（下载时置顶小窗显示进度条 + 百分比）：创建失败/被用户
@@ -450,7 +451,8 @@ mod tests {
     }
 
     /// install-client-update 源码形态锚点：
-    /// · 必须先 check_latest 复核，UpToDate 拒绝空装（not_found 明确报错）；
+    /// · 必须先 check_latest 复核，UpToDate 返回 {ok,upToDate:true} 不空装
+    ///   （垫片回显「已是最新」，非报错）；
     /// · 下载必须经 updater_client::download_to_temp（sha256 校验在其内
     ///   完成：digest 缓存/边车/大小下限——调用形态即校验路径），进度经
     ///   client-update-progress 事件；
@@ -469,7 +471,7 @@ mod tests {
         let chk = install.find("updater_client::check_latest(&current)").expect("必须先 check_latest 复核");
         let dl = install.find("updater_client::download_to_temp(&asset").expect("必须经 download_to_temp 下载（含 sha256 校验）");
         assert!(chk < dl, "先检查后下载（UpToDate 拒绝空装）");
-        assert!(install.contains("BridgeError::not_found(\"已是最新版本\")"), "无更新时明确报错而非空装");
+        assert!(install.contains("\"upToDate\": true"), "无更新时返回 upToDate 而非空装/报错");
         assert!(install.contains(".await"), "download_to_temp 是 async 契约");
         assert!(install.contains("\"client-update-progress\""), "下载进度必须经事件发出");
         assert!(install.contains("\"received\"") && install.contains("\"total\""), "进度载荷 {{received,total}}");

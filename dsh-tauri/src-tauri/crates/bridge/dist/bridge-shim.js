@@ -371,8 +371,9 @@
   // dsh 更新…」npm 内核链退役——内核随客户端整体分发）。交互照就地回显
   // 模式：点击→检查中…→「可更新 vX.Y.Z（源：Gitee/GitHub）[下载并安装]」
   // 或「已是最新」或「检查失败：<原因>」；下载中行尾显示百分比
-  // （client-update-progress 事件驱动）；安装前有会话运行时按钮转
-  // 「再点一次确认」防误中断（原生 confirm 被 polyfill 恒 true，不可用）。
+  // （client-update-progress 事件驱动）；安装前有会话运行时弹显式确认
+  // 「确认继续？[继续安装]/[取消]」防误中断（原生 confirm 被 polyfill 恒
+  // true，不可用）。
   // 开关类 toggle-* 经 menu_action 持久化到 settings.json 后重渲染；
   // sponsor 走 sponsorWindow；其余项点击后关菜单再发动作。点击面板外 /
   // Escape 关闭。
@@ -429,7 +430,8 @@
   /// 客户端更新检查的就地回显行（状态机全在 menuState.clientUpdate）：
   /// null=未查 | {next,sourceLabel}=可更新(+安装按钮) | {uptodate}=已是最新 |
   /// {downloading,pct}=下载中 | {installing}=安装中(Windows 进程即将退出) |
-  /// {done:'manual'|'replaced'}=mac/linux 降级形态 | {error}=失败 | {armed}=二次确认态。
+  /// {done:'manual'|'replaced'}=mac/linux 降级形态 | {error,errorKind}=失败 |
+  /// {armed}=有会话运行时的显式确认态。
   function updRowHtml() {
     var cu = menuState.clientUpdate;
     if (!cu) {
@@ -437,7 +439,7 @@
     }
     if (cu.error) {
       return menuItemHtml('check-client-update', '检查客户端更新…',
-        '<span class="dch-upd-info dch-upd-err">' + escHtml('检查失败：' + cu.error) + '</span>');
+        '<span class="dch-upd-info dch-upd-err">' + escHtml((cu.errorKind === 'install' ? '更新失败：' : '检查失败：') + cu.error) + '</span>');
     }
     var label;
     if (cu.downloading) {
@@ -453,29 +455,42 @@
     } else {
       label = '可更新 v' + (cu.next || '?') + (cu.sourceLabel ? '（源：' + cu.sourceLabel + '）' : '');
     }
-    // 安装按钮：仅「可更新」态显示；有会话运行时首点转 armed（提示再点一次
-    // 确认），次点才真正安装。
-    var btn = (!cu.downloading && !cu.installing && !cu.done && !cu.uptodate)
-      ? '<button class="dch-install"' + (cu.armed ? ' data-armed="1"' : '') + ' data-act="install-client-update">' +
-          (cu.armed ? '会话运行中，再点一次确认' : '下载并安装') + '</button>'
-      : '';
-    return '<div class="dch-upd-row">' +
-      '<button class="dch-item dch-upd-item" data-act="check-client-update">' +
+    var main = '<button class="dch-item dch-upd-item" data-act="check-client-update">' +
         '<span>检查客户端更新…</span><span class="dch-upd-info">' + escHtml(label) + '</span>' +
-      '</button>' + btn + '</div>';
+      '</button>';
+    // 有会话运行时安装会中断会话并重启应用：不再用隐晦的「再点一次确认」按钮
+    // 文案（用户体感「点了没反应」），改为明确的提示 + [继续安装]/[取消]。
+    if (cu.armed) {
+      return '<div class="dch-upd-col">' +
+        '<div class="dch-upd-row">' + main + '</div>' +
+        '<div class="dch-upd-confirm">' +
+          '<div class="dch-upd-confirm-msg">安装会中断当前会话并重启应用，确认继续？</div>' +
+          '<div class="dch-upd-confirm-btns">' +
+            '<button class="dch-install dch-confirm-go" data-act="install-client-update">继续安装</button>' +
+            '<button class="dch-install dch-confirm-cancel" data-act="cancel-install-confirm">取消</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }
+    // 安装按钮：仅「可更新」态显示。
+    var btn = (!cu.downloading && !cu.installing && !cu.done && !cu.uptodate)
+      ? '<button class="dch-install" data-act="install-client-update">下载并安装</button>'
+      : '';
+    return '<div class="dch-upd-row">' + main + btn + '</div>';
   }
   // 触发安装（auto=true 为 autoInstallUpdates 自动链——设置即授权，无页内
   // 二次确认；手动链的会话提醒在 armOrInstall）。
   function startClientUpdateInstall(auto) {
     var cu = menuState.clientUpdate || {};
     cu.downloading = true; cu.pct = 0; cu.armed = false; cu.auto = !!auto;
-    cu.uptodate = false; cu.done = null; cu.installing = false; cu.error = null;
+    cu.uptodate = false; cu.done = null; cu.installing = false; cu.error = null; cu.errorKind = null;
     menuState.clientUpdate = cu;
     renderMenu();
     dshDesktop.menu.action('install-client-update').then(function (r) {
       var cur = menuState.clientUpdate || {};
       cur.downloading = false;
-      if (r && r.manual) cur.done = 'manual';
+      if (r && r.upToDate) cur.uptodate = true;
+      else if (r && r.manual) cur.done = 'manual';
       else if (r && r.replaced) cur.done = 'replaced';
       else if (r && r.installing) cur.installing = true;
       if (r && r.version) cur.next = String(r.version);
@@ -486,6 +501,7 @@
     }).catch(function (e) {
       var cur = menuState.clientUpdate || {};
       cur.downloading = false;
+      cur.errorKind = 'install';
       cur.error = (e && e.message) ? String(e.message).replace(/^\[[A-Z_]+\]\s*/, '') : '未知错误';
       menuState.clientUpdate = cur;
       renderMenu();
@@ -495,7 +511,8 @@
     var cu = menuState.clientUpdate;
     if (!cu || cu.downloading || cu.installing || cu.done || cu.uptodate) return;
     if (!currentSessionId || cu.armed) { startClientUpdateInstall(false); return; }
-    // 有会话运行：安装会杀内核中断会话——按钮转 armed 态提醒，关菜单即解除。
+    // 有会话运行：安装会杀内核中断会话——转 armed 态弹显式确认（updRowHtml
+    // 渲染提示 + [继续安装]/[取消]），点「继续安装」/「取消」解除。
     cu.armed = true;
     renderMenu();
   }
@@ -598,13 +615,20 @@
               renderMenu();
             }).catch(function (e) {
               menuState.clientUpdate = {
-                error: (e && e.message) ? String(e.message).replace(/^\[[A-Z_]+\]\s*/, '') : '未知错误'
+                error: (e && e.message) ? String(e.message).replace(/^\[[A-Z_]+\]\s*/, '') : '未知错误',
+                errorKind: 'check'
               };
               renderMenu();
             });
             return;
           }
           if (act === 'install-client-update') { armOrInstall(); return; }
+          if (act === 'cancel-install-confirm') {
+            // 取消有会话运行时的安装确认：回到「下载并安装」态，不关菜单、不发安装。
+            if (menuState.clientUpdate) menuState.clientUpdate.armed = false;
+            renderMenu();
+            return;
+          }
           closeMenu();
           if (act === 'sponsor') { try { dshDesktop.sponsorWindow(); } catch (e2) {} return; }
           try { dshDesktop.menu.action(act).catch(function () {}); } catch (e2) {}
@@ -765,7 +789,13 @@
           'background:transparent;color:var(--dsw-alias-label-secondary,var(--dch-fg2))}' +
         '#' + MENU_ID + ' .dch-install:hover{background:var(--dsw-alias-interactive-bg-hover,var(--dch-hover));' +
           'color:var(--dsw-alias-label-primary,var(--dch-fg))}' +
-        '#' + MENU_ID + ' .dch-install[data-armed="1"]{color:var(--dsw-alias-state-warning-primary,#ffb86c);' +
+        '#' + MENU_ID + ' .dch-upd-col{display:flex;flex-direction:column;gap:4px;padding:2px 0}' +
+        '#' + MENU_ID + ' .dch-upd-confirm{padding:7px 8px;border:1px solid var(--dsw-alias-state-warning-primary,#ffb86c);' +
+          'border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-state-warning-primary,#ffb86c) 8%,transparent)}' +
+        '#' + MENU_ID + ' .dch-upd-confirm-msg{font-size:11px;line-height:16px;' +
+          'color:var(--dsw-alias-label-primary,var(--dch-fg,#e6ecff));margin-bottom:6px}' +
+        '#' + MENU_ID + ' .dch-upd-confirm-btns{display:flex;gap:6px;justify-content:flex-end}' +
+        '#' + MENU_ID + ' .dch-install.dch-confirm-go{color:var(--dsw-alias-state-warning-primary,#ffb86c);' +
           'border-color:color-mix(in srgb,var(--dsw-alias-state-warning-primary,#ffb86c) 55%,transparent)}' +
         // ⋯ 图形是实心三点：覆盖条按钮的线性 stroke 缺省。
         '#' + CHROME_ID + ' button.dch-menu-btn svg{fill:currentColor;stroke:none}' +
