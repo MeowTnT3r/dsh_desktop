@@ -1041,6 +1041,13 @@ fn upgrade_first_run_report(state: &AppState) {
 /// 任一时刻至多一个活跃监测线程。
 static HEARTBEAT_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// 心跳监测循环单次 sleep 的 wall-clock 跳跃阈值（系统休眠/唤醒守卫）。
+/// 超过即判定进程被系统挂起过（休眠/合盖/锁屏深睡），心跳基准重锚、恢复梯
+/// 复位——不把休眠期间的渲染进程冻结误判为停摆（否则唤醒后「睡了一觉」被
+/// 当成 40s 停摆，逐级升级到 reload/navigate/整窗重启）。取 30s = 3 倍于
+/// 10s 轮询周期，远大于正常调度抖动（毫秒级~数秒），绝不误伤正常轮询。
+const RENDERER_WATCH_SLEEP_JUMP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 心跳监测的「页面定时器有效」判定（纯函数，可单测）。
 ///
 /// 不可见（closeToTray 隐藏）**或最小化**的主窗，其页面定时器被 WebView2
@@ -1222,10 +1229,31 @@ fn watch_renderer_heartbeat(app: tauri::AppHandle) {
         // 达阈值升级 supervisor 级内核重启（实证整窗重启是唯一有效恢复）。
         let mut navigate_failures: u32 = 0;
         loop {
+            // 系统休眠/唤醒守卫：用 wall-clock（SystemTime）量测本次 sleep 的
+            // 实际流逝——Windows 的 std::time::Instant（QPC）在休眠/休眠唤醒
+            // 期间不走表，无法判定；SystemTime（GetSystemTimeAsFileTime）随
+            // 墙钟前进。实际流逝远超 10s = 进程被系统挂起过，期间渲染进程
+            // 同样冻结、心跳必然停摆——这不是真挂死，不得计入失联（否则唤醒后
+            // 把「睡了一觉」误判成 40s 停摆，逐级升级到 reload/navigate/整窗重启）。
+            let tick_start = std::time::SystemTime::now();
             std::thread::sleep(std::time::Duration::from_secs(10));
             // 代数交替：有更晚的监测线程接岗 → 本线程退出（防重启循环下线程只增不减）。
             if HEARTBEAT_WATCHER_GEN.load(Ordering::Relaxed) != gen {
                 return;
+            }
+            if std::time::SystemTime::now()
+                .duration_since(tick_start)
+                .unwrap_or_default()
+                > RENDERER_WATCH_SLEEP_JUMP
+            {
+                if let Some(state) = app.try_state::<AppState>() {
+                    route_log("[renderer-recovery] 检测到系统休眠/唤醒（wall-clock 跳跃），心跳基准重锚、恢复梯复位".to_string());
+                    last = state.hb_main.load(Ordering::Relaxed);
+                }
+                stall = 0;
+                stage = 0;
+                navigate_failures = 0;
+                continue;
             }
             let Some(state) = app.try_state::<AppState>() else { return };
             let Some(win) = app.get_webview_window("main") else { return };
@@ -1241,6 +1269,14 @@ fn watch_renderer_heartbeat(app: tauri::AppHandle) {
                 // hb_main（复位到全局 heartbeats 会造成一拍的假「有进展」，
                 // 虽下一轮自愈，口径混用留给后人必炸）。
                 last = state.hb_main.load(Ordering::Relaxed);
+                // 全量复位恢复梯：豁免期（最小化/后台/页面 hidden）不单停摆
+                // 计数清零，恢复梯阶段与 K3 终态兜底计数也必须清零——否则一次
+                // 「可见期瞬时抖动 → 最小化 → 恢复」就把 stage 抬到
+                // NativeNavigate 附近，恢复后的下一次停摆直接跳到高级别动作、
+                // 再 3 次即整窗重启（用户体感「莫名其妙白屏重启」）。与心跳
+                // 恢复分支的复位语义对齐。
+                stage = 0;
+                navigate_failures = 0;
                 continue;
             }
             let now = state.hb_main.load(Ordering::Relaxed);
@@ -1453,6 +1489,44 @@ mod heartbeat_watcher_tests {
         assert!(
             !seg.contains("win.is_visible().unwrap_or(true)"),
             "不得再裸判 is_visible（漏最小化节流形态）: {seg}"
+        );
+    }
+
+    /// 形态锚点（休眠/唤醒 + 豁免全量复位，2026-08「合盖/锁屏后唤醒即白屏
+    /// 重启」）：① 监测循环必须用 SystemTime 量测 sleep 实际流逝并做跳跃守卫
+    /// （Instant/QPC 在 Windows 休眠期间不走表，无法判定）；② 豁免分支必须
+    /// 复位恢复梯 stage 与 K3 终态兜底计数 navigate_failures——只复位
+    /// stall/last 会把可见期瞬时抖动抬高的 stage 泄漏到恢复后，下一次停摆
+    /// 直接跳到高级别动作、再 3 次即整窗重启。
+    #[test]
+    fn heartbeat_watcher_sleep_guard_and_exempt_full_reset_shape() {
+        let src = include_str!("lib.rs").replace("\r\n", "\n");
+        let seg = src
+            .split("fn watch_renderer_heartbeat")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n\n/// 诊断探针").next())
+            .expect("watch_renderer_heartbeat 函数体");
+        assert!(
+            seg.contains("RENDERER_WATCH_SLEEP_JUMP"),
+            "必须有系统休眠/唤醒跳跃守卫常量: {seg}"
+        );
+        assert!(
+            seg.contains("SystemTime::now()"),
+            "跳跃守卫必须用 wall-clock（SystemTime）——Instant/QPC 休眠期间不走表: {seg}"
+        );
+        // 豁免分支（stall_exempt 之后到首个 continue）必须复位 stage 与 navigate_failures。
+        let exempt_seg = seg
+            .split("stall_exempt(")
+            .nth(1)
+            .and_then(|s| s.split("continue;").next())
+            .expect("豁免分支");
+        assert!(
+            exempt_seg.contains("stage = 0;"),
+            "豁免分支必须复位恢复梯 stage（否则泄漏到恢复后）: {exempt_seg}"
+        );
+        assert!(
+            exempt_seg.contains("navigate_failures = 0;"),
+            "豁免分支必须复位 K3 终态兜底计数 navigate_failures: {exempt_seg}"
         );
     }
 
